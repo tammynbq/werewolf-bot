@@ -406,7 +406,11 @@ class VoteSelect(discord.ui.Select):
         if interaction.user.id not in self._allowed:
             await interaction.response.send_message("你不是存活玩家，不能投票。", ephemeral=True)
             return
-        self._votes[interaction.user.id] = int(self.values[0])
+        try:
+            self._votes[interaction.user.id] = int(self.values[0])
+        except (ValueError, IndexError):
+            await interaction.response.send_message("没读到你的选择，请再选一次。", ephemeral=True)
+            return
         await interaction.response.send_message("🗳️ 已记录你的投票（可重选覆盖）。", ephemeral=True)
         if self._allowed and set(self._votes.keys()) >= self._allowed:
             self._parent.stop()
@@ -426,6 +430,19 @@ class VoteView(discord.ui.View):
             return
         await interaction.response.send_message("⏩ 提前结束投票，公布结果…", ephemeral=True)
         self.stop()
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception,
+                       item: discord.ui.Item) -> None:
+        # 默认实现只打日志、不回应交互，会让玩家看到「交互失败」。这里显式反馈，
+        # 并把真实异常记到日志，方便定位（避免静默吞错）。
+        log.exception("投票交互出错：item=%s", item, exc_info=error)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("投票时出了点问题，请再点一次。", ephemeral=True)
+            else:
+                await interaction.response.send_message("投票时出了点问题，请再点一次。", ephemeral=True)
+        except discord.HTTPException:
+            pass
 
 
 # ============================================================
