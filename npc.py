@@ -207,3 +207,32 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
     if len(cleaned) >= 4:
         return cleaned
     return random.choice(_FALLBACK_LINES)
+
+
+_LAST_WORD_FALLBACK = [
+    "好人加油，把狼揪出来，别让我白死！",
+    "我走了，剩下的就靠你们了……",
+    "记住这轮的票型，别再投错好人。",
+    "唉，没想到这么快下去，盘好局势！",
+]
+
+
+async def last_word(player: Player, state: GameState) -> str:
+    """出局的 NPC 留一句遗言。"""
+    secret = _role_brief(player, state)
+    system = (
+        "你正在玩中文《狼人杀》，扮演一名刚刚出局的玩家，现在留一句简短遗言，绝不承认自己是 AI。"
+        f"你是【{player.seat}号·{player.name}】，性格「{player.persona}」。"
+        "遗言要贴合身份与性格：好人可以喊话、提醒站边、给信息；狼人可以继续伪装或卖好人。"
+        "只说 1~2 句、15~50 字，口语化；不要加引号、不要写名字前缀、不要用 markdown。"
+    )
+    user = (
+        f"【只有你知道的秘密】{secret}\n"
+        f"存活玩家：{_alive_roster(state)}。\n"
+        f"你（{player.seat}号·{player.name}）刚出局了，留一句遗言："
+    )
+    raw = await llm.chat(system, user, max_tokens=120)
+    cleaned = _clean_speech(raw, player)
+    if len(cleaned) >= 3:
+        return cleaned
+    return random.choice(_LAST_WORD_FALLBACK)

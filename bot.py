@@ -171,7 +171,8 @@ class RoleRevealView(discord.ui.View):
 class VoteSelect(discord.ui.Select):
     """白天公开投票（共享，多个存活玩家都能投）。"""
 
-    def __init__(self, options: list[tuple[str, str]], allowed_ids: set[int], votes: dict[int, int]):
+    def __init__(self, options: list[tuple[str, str]], allowed_ids: set[int],
+                 votes: dict[int, int], parent: "VoteView"):
         super().__init__(
             placeholder="选择要放逐的玩家…",
             min_values=1,
@@ -180,6 +181,7 @@ class VoteSelect(discord.ui.Select):
         )
         self._allowed = allowed_ids
         self._votes = votes
+        self._parent = parent
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id not in self._allowed:
@@ -188,17 +190,31 @@ class VoteSelect(discord.ui.Select):
             )
             return
         self._votes[interaction.user.id] = int(self.values[0])
-        target = self.values[0]
         await interaction.response.send_message(
             "🗳️ 已记录你的投票（可重选覆盖）。", ephemeral=True
         )
+        # 所有存活真人都投完了 → 立即结束投票、公布结果
+        if self._allowed and set(self._votes.keys()) >= self._allowed:
+            self._parent.stop()
 
 
 class VoteView(discord.ui.View):
-    def __init__(self, options: list[tuple[str, str]], allowed_ids: set[int], timeout: int):
+    def __init__(self, options: list[tuple[str, str]], allowed_ids: set[int],
+                 host_id: int, timeout: int):
         super().__init__(timeout=timeout)
         self.votes: dict[int, int] = {}
-        self.add_item(VoteSelect(options, allowed_ids, self.votes))
+        self.host_id = host_id
+        self.add_item(VoteSelect(options, allowed_ids, self.votes, self))
+
+    @discord.ui.button(label="结束投票并公布", style=discord.ButtonStyle.primary, emoji="⏩")
+    async def finish(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.host_id:
+            await interaction.response.send_message(
+                "只有房主能提前结束投票。", ephemeral=True
+            )
+            return
+        await interaction.response.send_message("⏩ 提前结束投票，公布结果…", ephemeral=True)
+        self.stop()
 
 
 class LobbyView(discord.ui.View):
@@ -384,32 +400,64 @@ async def run_discussion(bot: discord.Client, state: GameState, channel, day_log
     order = list(state.alive_players)  # players 已按座位号排序
     order_txt = " → ".join(f"{p.seat}号" for p in order)
     await channel.send(
-        "☀️ **天亮了，开始讨论。** 按座位号轮流发言：\n"
+        "☀️ **天亮了，开始讨论。** 按座位号轮流发言（**没轮到你时发言会被自动删除**）：\n"
         f"📋 {order_txt}"
     )
-    for player in order:
-        if player.is_npc:
-            await channel.typing()
-            speech = await npc.speak(player, state, day_log)
-            await channel.send(f"**{player.label}**：{speech}")
-            day_log.append(f"{player.seat}号{player.name}: {speech}")
-            await asyncio.sleep(1.2)  # 模拟打字节奏，避免刷屏
-        else:
-            await channel.send(
-                f"🎤 现在轮到 **{player.seat}号** 玩家 {player.mention} 发言，"
-                f"请在 **{config.TURN_SECONDS} 秒**内于本频道发言。"
-            )
-            try:
-                msg = await bot.wait_for(
-                    "message",
-                    timeout=config.TURN_SECONDS,
-                    check=lambda m: m.author.id == player.uid
-                    and m.channel.id == channel.id,
+    state.discussion_active = True
+    try:
+        for player in order:
+            if player.is_npc:
+                state.current_speaker_uid = None
+                await channel.typing()
+                speech = await npc.speak(player, state, day_log)
+                await channel.send(f"**{player.label}**：{speech}")
+                day_log.append(f"{player.seat}号{player.name}: {speech}")
+                await asyncio.sleep(1.2)  # 模拟打字节奏，避免刷屏
+            else:
+                state.current_speaker_uid = player.uid  # 只有他能发言
+                await channel.send(
+                    f"🎤 现在轮到 **{player.seat}号** 玩家 {player.mention} 发言，"
+                    f"请在 **{config.TURN_SECONDS} 秒**内发言（其他人请稍候）。"
                 )
-                day_log.append(f"{player.seat}号{player.name}: {msg.content}")
-            except asyncio.TimeoutError:
-                await channel.send(f"（{player.label} 超时，跳过发言）")
-                day_log.append(f"{player.seat}号{player.name}: （沉默/超时）")
+                try:
+                    msg = await bot.wait_for(
+                        "message",
+                        timeout=config.TURN_SECONDS,
+                        check=lambda m: m.author.id == player.uid
+                        and m.channel.id == channel.id,
+                    )
+                    day_log.append(f"{player.seat}号{player.name}: {msg.content}")
+                except asyncio.TimeoutError:
+                    await channel.send(f"（{player.label} 超时，跳过发言）")
+                    day_log.append(f"{player.seat}号{player.name}: （沉默/超时）")
+                finally:
+                    state.current_speaker_uid = None
+    finally:
+        state.discussion_active = False
+        state.current_speaker_uid = None
+
+
+async def collect_last_words(bot: discord.Client, state: GameState, channel, player, seconds: int = 30) -> None:
+    """被杀 / 被放逐的玩家留遗言；NPC 由 LLM 生成一句。"""
+    if player.is_npc:
+        text = await npc.last_word(player, state)
+        await channel.send(f"🪦 **{player.label}** 的遗言：{text}")
+        return
+    state.current_speaker_uid = player.uid
+    await channel.send(
+        f"🪦 {player.mention} 出局了，请在 **{seconds} 秒**内留下遗言（直接发言；不想说可忽略）。"
+    )
+    try:
+        msg = await bot.wait_for(
+            "message",
+            timeout=seconds,
+            check=lambda m: m.author.id == player.uid and m.channel.id == channel.id,
+        )
+        await channel.send(f"🪦 **{player.label}** 的遗言：{msg.content}")
+    except asyncio.TimeoutError:
+        await channel.send(f"（{player.label} 没有留下遗言。）")
+    finally:
+        state.current_speaker_uid = None
 
 
 async def run_vote(bot: discord.Client, state: GameState, channel, day_log: list[str]):
@@ -421,9 +469,10 @@ async def run_vote(bot: discord.Client, state: GameState, channel, day_log: list
 
     votes: dict[int, int] = {}
     if human_ids:
-        view = VoteView(options, human_ids, config.TURN_SECONDS)
+        view = VoteView(options, human_ids, state.host_id, config.TURN_SECONDS)
         msg = await channel.send(
-            f"🗳️ **投票放逐阶段**（{config.TURN_SECONDS} 秒）！存活玩家请在下方选择：",
+            f"🗳️ **投票放逐阶段**（{config.TURN_SECONDS} 秒）！存活玩家请在下方选择，"
+            f"全员投完会立即公布（房主也可点『结束投票』提前公布）：",
             view=view,
         )
         await view.wait()
@@ -467,6 +516,7 @@ async def run_vote(bot: discord.Client, state: GameState, channel, day_log: list
             f"🔨 **{exiled.label}** 被放逐出局，身份是 {exiled.role.emoji}**{exiled.role.cn}**。"
         )
         day_log.append(f"{exiled.name} 被投票放逐，身份是{exiled.role.cn}。")
+        await collect_last_words(bot, state, channel, exiled)
 
 
 async def announce_end(channel, state: GameState) -> None:
@@ -483,6 +533,7 @@ async def announce_end(channel, state: GameState) -> None:
 
 async def run_game(bot: discord.Client, state: GameState, channel) -> None:
     """整局游戏主循环。"""
+    state.play_channel_id = channel.id  # 发言管控只作用于这个频道/讨论串
     try:
         # 1) NPC 补位
         target = max(config.TOTAL_PLAYERS, len(state.humans))
@@ -519,6 +570,7 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
             if victim:
                 await channel.send(f"🌅 天亮了。昨晚 **{victim.label}** 倒下了。")
                 day_log.append(f"第{state.day_count}晚，{victim.name}被杀。")
+                await collect_last_words(bot, state, channel, victim)
             else:
                 await channel.send("🌅 天亮了。昨晚是平安夜，无人死亡。")
                 day_log.append(f"第{state.day_count}晚，平安夜。")
@@ -684,6 +736,30 @@ client.tree.add_command(werewolf)
 @client.event
 async def on_ready():
     log.info("已登录为 %s（id=%s）", client.user, client.user.id)
+
+
+@client.event
+async def on_message(message: discord.Message):
+    """白天轮流发言时，删掉非当前发言人的消息，强制按顺序发言。"""
+    if message.author.bot:
+        return
+    ch = message.channel
+    cid = ch.parent_id if isinstance(ch, discord.Thread) else ch.id
+    state = games.get(cid)
+    if state is None or not state.discussion_active:
+        return
+    if message.channel.id != state.play_channel_id:
+        return
+    if message.author.id == state.current_speaker_uid:
+        return
+    try:
+        await message.delete()
+        await message.channel.send(
+            f"⏳ {message.author.mention} 还没轮到你发言，请等点到你时再说。",
+            delete_after=4,
+        )
+    except discord.HTTPException:
+        pass
 
 
 def run() -> None:

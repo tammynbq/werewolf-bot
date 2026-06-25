@@ -32,6 +32,11 @@ class GameState:
         self.winner: Team | None = None
         # 本局私密讨论串的 id（无则在频道内进行）
         self.thread_id: int | None = None
+        # 游戏实际进行的频道/讨论串 id；发言管控只作用于此
+        self.play_channel_id: int | None = None
+        # 白天轮流发言阶段：是否启用「只有当前发言人能说话」
+        self.discussion_active: bool = False
+        self.current_speaker_uid: int | None = None
         # 每晚的临时记录
         self.last_killed: Player | None = None
 
