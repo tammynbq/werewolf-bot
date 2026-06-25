@@ -42,6 +42,8 @@ TOTAL_PLAYERS: int = _int("WEREWOLF_TOTAL_PLAYERS", 6)
 TURN_SECONDS: int = _int("WEREWOLF_TURN_SECONDS", 60)
 # 真人打字发言/遗言的时限：给慢手留足时间（NPC 不受影响、立即生成，不会卡住）。
 SPEAK_SECONDS: int = _int("WEREWOLF_SPEAK_SECONDS", 300)
+# 投票时限：太短的话视图会超时变"死"，点了就『交互失败』。给足思考时间。
+VOTE_SECONDS: int = _int("WEREWOLF_VOTE_SECONDS", 180)
 REVEAL_SECONDS: int = _int("WEREWOLF_REVEAL_SECONDS", 20)
 NPC_TEMPERATURE: float = _float("WEREWOLF_NPC_TEMPERATURE", 0.9)
 # LLM 单次调用超时（秒）：超时即走兜底，避免中转站卡死拖住整局。

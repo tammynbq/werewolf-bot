@@ -35,6 +35,7 @@ games: dict[int, GameState] = {}
 REVEAL_SECONDS = config.REVEAL_SECONDS
 TURN = config.TURN_SECONDS
 SPEAK = config.SPEAK_SECONDS  # 真人打字发言/遗言的时限（给慢手留足时间）
+VOTE = config.VOTE_SECONDS    # 投票时限（太短视图会超时变死、点了就交互失败）
 
 # 子区慢速模式：Discord 慢速上限为 6 小时（21600 秒）。开到最大，
 # 配合面板模式的统一禁言，确保玩家无法在子区里自由打字发言。
@@ -405,7 +406,11 @@ class VoteSelect(discord.ui.Select):
         if interaction.user.id not in self._allowed:
             await interaction.response.send_message("你不是存活玩家，不能投票。", ephemeral=True)
             return
-        self._votes[interaction.user.id] = int(self.values[0])
+        try:
+            self._votes[interaction.user.id] = int(self.values[0])
+        except (ValueError, IndexError):
+            await interaction.response.send_message("没读到你的选择，请再选一次。", ephemeral=True)
+            return
         await interaction.response.send_message("🗳️ 已记录你的投票（可重选覆盖）。", ephemeral=True)
         if self._allowed and set(self._votes.keys()) >= self._allowed:
             self._parent.stop()
@@ -425,6 +430,19 @@ class VoteView(discord.ui.View):
             return
         await interaction.response.send_message("⏩ 提前结束投票，公布结果…", ephemeral=True)
         self.stop()
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception,
+                       item: discord.ui.Item) -> None:
+        # 默认实现只打日志、不回应交互，会让玩家看到「交互失败」。这里显式反馈，
+        # 并把真实异常记到日志，方便定位（避免静默吞错）。
+        log.exception("投票交互出错：item=%s", item, exc_info=error)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("投票时出了点问题，请再点一次。", ephemeral=True)
+            else:
+                await interaction.response.send_message("投票时出了点问题，请再点一次。", ephemeral=True)
+        except discord.HTTPException:
+            pass
 
 
 # ============================================================
@@ -798,16 +816,27 @@ async def phase_vote(bot, state: GameState, panel: Panel, channel, day_log: list
 
     votes: dict[int, int] = {}
     if human_ids:
-        view = VoteView(options, human_ids, state.host_id, TURN)
+        view = VoteView(options, human_ids, state.host_id, VOTE)
+        # 投票面板单独发一条新消息承载（不复用常驻面板），组件干净、不易超时失效。
         await panel.show(
             title="🗳️ 第 %d 天 · 投票放逐" % state.day_count,
-            desc=(f"存活玩家请在下方选择要放逐的人（{TURN} 秒）。\n"
-                  f"全员投完会立即公布（房主也可点『结束投票』提前公布）。"),
-            color=C_DAY, view=view,
+            desc="存活玩家请在下方的投票面板里选择要放逐的人。",
+            color=C_DAY,
         )
+        vote_embed = discord.Embed(
+            title="🗳️ 投票放逐",
+            description=(f"存活玩家请选择要放逐的人（{VOTE} 秒内）。\n"
+                        f"全员投完会立即公布（房主也可点『结束投票』提前公布）。"),
+            color=C_DAY,
+        )
+        vote_msg = await channel.send(embed=vote_embed, view=view)
         await view.wait()
         votes.update(view.votes)
         view.stop()
+        try:
+            await vote_msg.edit(view=None)  # 投票结束后清掉按钮，避免残留可点
+        except discord.HTTPException:
+            pass
 
     for p in alive:
         if p.is_npc:
