@@ -23,6 +23,7 @@ def _get_client() -> AsyncOpenAI:
         _client = AsyncOpenAI(
             api_key=config.OPENAI_API_KEY or "missing",
             base_url=config.OPENAI_BASE_URL,
+            timeout=config.LLM_TIMEOUT_SECONDS,  # 超时即兜底，避免卡死整局
         )
     return _client
 

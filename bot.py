@@ -34,6 +34,7 @@ games: dict[int, GameState] = {}
 
 REVEAL_SECONDS = config.REVEAL_SECONDS
 TURN = config.TURN_SECONDS
+SPEAK = config.SPEAK_SECONDS  # 真人打字发言/遗言的时限（给慢手留足时间）
 
 # 子区慢速模式：Discord 慢速上限为 6 小时（21600 秒）。开到最大，
 # 配合面板模式的统一禁言，确保玩家无法在子区里自由打字发言。
@@ -80,6 +81,20 @@ async def wait_event(event: asyncio.Event, timeout: int) -> None:
     try:
         await asyncio.wait_for(event.wait(), timeout=timeout)
     except asyncio.TimeoutError:
+        pass
+
+
+async def dm_user(uid: int, text: str) -> None:
+    """私信提醒某个真人玩家（如『轮到你发言了』）。
+
+    匿名模式下不在公开频道 @ 人，改用私信单独提示当事人，既给提醒又不暴露
+    座位号背后是谁。私信关闭/失败时静默忽略。
+    """
+    try:
+        user = client.get_user(uid) or await client.fetch_user(uid)
+        if user is not None:
+            await user.send(text)
+    except discord.HTTPException:
         pass
 
 
@@ -689,14 +704,15 @@ async def collect_last_words(state: GameState, panel: Panel, channel, player) ->
     fut: asyncio.Future = loop.create_future()
     state.current_speaker_uid = player.uid
     view = SpeechGateView(player, fut, btn_label="留遗言", modal_title="你的遗言",
-                          input_label="留下你的遗言（可留空）", timeout=30)
+                          input_label="留下你的遗言（可留空）", timeout=SPEAK)
+    await dm_user(player.uid, f"🪦 你（{player.seat}号）出局了，回到游戏面板点『留遗言』留下遗言吧。")
     await panel.show(
         title="🪦 遗言",
-        desc=f"**{player.label}** 出局了，请在 **30 秒**内点按钮留下遗言。",
+        desc=f"**{player.label}** 出局了，请点按钮留下遗言（不限时，留完即继续）。",
         color=C_DAY, view=view,
     )
     try:
-        text = await asyncio.wait_for(fut, timeout=30)
+        text = await asyncio.wait_for(fut, timeout=SPEAK)
         if text.strip():
             await channel.send(f"🪦 **{player.label}** 的遗言：{text}")  # label 已是匿名座位号
         else:
@@ -738,26 +754,29 @@ async def phase_discussion(bot, state: GameState, panel: Panel, channel, day_log
                 desc=f"轮到 **{player.label}** 发言…\n\n📋 顺序：{order_txt}",
                 color=C_DAY, footer="按座位号轮流发言",
             )
-            await channel.typing()
-            speech = await npc.speak(player, state, day_log)
+            # 先生成发言，再按字数模拟「真人打字」的停顿，避免 NPC 秒回暴露身份
+            async with channel.typing():
+                speech = await npc.speak(player, state, day_log)
+                await asyncio.sleep(min(9.0, 1.5 + len(speech) * 0.12))
             await channel.send(f"💬 **{player.label}**：{speech}")
             day_log.append(f"{player.seat}号: {speech}")
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(0.6)
         else:
             loop = asyncio.get_running_loop()
             fut: asyncio.Future = loop.create_future()
             state.current_speaker_uid = player.uid
             view = SpeechGateView(player, fut, btn_label="我要发言", modal_title="你的发言",
-                                  input_label="输入你的发言", timeout=TURN)
+                                  input_label="输入你的发言", timeout=SPEAK)
+            await dm_user(player.uid, f"🎤 轮到你（{player.seat}号）发言了，回游戏面板点『我要发言』吧。")
             await panel.show(
                 title="☀️ 第 %d 天 · 讨论" % state.day_count,
                 desc=(f"🎤 现在轮到 **{player.seat}号** 发言（请对号入座，只有本人能点发言）。\n"
-                      f"请在 **{TURN} 秒**内点下方按钮输入发言（其他人请稍候）。\n\n"
+                      f"已私信提醒当事人；点下方按钮输入发言，不限时、发完即继续（其他人请稍候）。\n\n"
                       f"📋 顺序：{order_txt}"),
                 color=C_DAY, view=view, footer="点『我要发言』弹出输入框",
             )
             try:
-                text = await asyncio.wait_for(fut, timeout=TURN)
+                text = await asyncio.wait_for(fut, timeout=SPEAK)
                 if text.strip():
                     await channel.send(f"💬 **{player.label}**：{text}")
                     day_log.append(f"{player.seat}号: {text}")
@@ -792,7 +811,7 @@ async def phase_vote(bot, state: GameState, panel: Panel, channel, day_log: list
 
     for p in alive:
         if p.is_npc:
-            t = npc.vote_target(p, state)
+            t = await npc.vote_decision(p, state, day_log)
             if t is not None:
                 votes[p.uid] = t
 

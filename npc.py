@@ -122,6 +122,53 @@ def vote_target(voter: Player, state: GameState) -> int | None:
     return random.choice(alive_others).uid
 
 
+def _parse_seat(raw: str, valid_seats: dict[int, int]) -> int | None:
+    """从 LLM 回复里抠出一个合法的座位号，抠不到返回 None。"""
+    if not raw:
+        return None
+    for m in re.findall(r"\d+", raw):
+        seat = int(m)
+        if seat in valid_seats:
+            return seat
+    return None
+
+
+async def vote_decision(voter: Player, state: GameState, recent_log: list[str]) -> int | None:
+    """NPC 的投票决策（返回目标 uid）。
+
+    - 狼人 / 预言家：有明确最优解，沿用规则（更快、零风险，不会误投队友）。
+    - 平民 / 女巫：让 LLM 结合白天发言挑出最可疑的人，避免「乱投」一眼被看穿是 AI。
+      解析失败 / LLM 不可用时回退到规则随机，保证不会卡住。
+    """
+    if voter.role in (Role.WEREWOLF, Role.SEER):
+        return vote_target(voter, state)
+
+    alive_others = [p for p in state.alive_players if p.uid != voter.uid]
+    if not alive_others:
+        return None
+    valid_seats = {p.seat: p.uid for p in alive_others}
+    secret = _role_brief(voter, state)
+    log_text = "\n".join(recent_log[-16:]) if recent_log else "（今天还没什么有效发言）"
+    seat_list = "、".join(f"{s}号" for s in sorted(valid_seats))
+    system = (
+        "你正在玩中文《狼人杀》，是好人阵营，现在进入投票放逐环节，要投出你认为最可能是狼的人。"
+        f"你是【{voter.seat}号】，性格「{voter.persona}」。"
+        "结合今天的发言逻辑、前后矛盾、甩锅与站边来判断，别乱投。"
+        f"只输出一个座位号数字（从 {seat_list} 里选），不要任何多余文字、不要解释。"
+    )
+    user = (
+        f"【只有你知道的秘密】{secret}\n"
+        f"可投的人：{seat_list}。\n"
+        f"今天的发言记录：\n{log_text}\n\n"
+        "你要投谁？只回一个座位号数字："
+    )
+    raw = await llm.chat(system, user, max_tokens=8, temperature=0.5)
+    seat = _parse_seat(raw, valid_seats)
+    if seat is not None:
+        return valid_seats[seat]
+    return vote_target(voter, state)
+
+
 # ============ LLM 发言 ============
 
 def _role_brief(player: Player, state: GameState) -> str:
