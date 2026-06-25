@@ -130,7 +130,7 @@ def _role_brief(player: Player, state: GameState) -> str:
     lines = [f"你的真实身份是【{player.role.cn}】。"]
     if player.role is Role.WEREWOLF:
         mates = [
-            p.name for p in state.players
+            f"{p.seat}号" for p in state.players
             if p.role and p.role.is_wolf and p.uid != player.uid
         ]
         if mates:
@@ -143,7 +143,7 @@ def _role_brief(player: Player, state: GameState) -> str:
             for uid, is_wolf in player.seer_results.items():
                 target = state.get(uid)
                 if target:
-                    checked.append(f"{target.name}是{'狼人' if is_wolf else '好人'}")
+                    checked.append(f"{target.seat}号是{'狼人' if is_wolf else '好人'}")
             lines.append("你的查验结果：" + "；".join(checked) + "。可以选择性地报验或隐藏。")
         else:
             lines.append("你还没有查验结果。")
@@ -156,8 +156,8 @@ def _role_brief(player: Player, state: GameState) -> str:
 
 
 def _alive_roster(state: GameState) -> str:
-    """带座位号的存活玩家名单，方便 NPC 用『几号』互相称呼。"""
-    return "、".join(f"{p.seat}号{p.name}" for p in state.alive_players)
+    """存活玩家名单（只用座位号，全程匿名），方便 NPC 用『几号』互相称呼。"""
+    return "、".join(f"{p.seat}号" for p in state.alive_players)
 
 
 # 兜底发言：LLM 不可用 / 返回垃圾时用，保证不刷乱码
@@ -210,7 +210,7 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
     system = (
         "你是一名正在玩中文桌游《狼人杀》的真人玩家，绝对不是 AI，也绝不承认自己是 AI 或跳出游戏。"
         "场上身份有狼人、预言家、平民：好人靠发言和投票找出并放逐狼人；狼人要隐藏身份、误导好人、保护狼队友。"
-        f"你是【{player.seat}号·{player.name}】，性格是「{player.persona}」，发言要带出这种性格。\n"
+        f"你是【{player.seat}号】，性格是「{player.persona}」，发言要带出这种性格。\n"
         "发言要求：\n"
         "1. 像真人在群里聊天，口语自然，可以带点情绪、口头禅或调侃。\n"
         "2. 要结合本局信息针对具体的人表态，用『几号』称呼别人，比如『我觉得3号有点可疑』『同意5号』。\n"
@@ -222,7 +222,7 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
         f"现在是第 {state.day_count} 天白天，大家按座位号轮流发言。\n"
         f"本局存活玩家：{_alive_roster(state)}。\n"
         f"目前为止的场上发言与信息：\n{log_text}\n\n"
-        f"轮到你（{player.seat}号·{player.name}）了，直接说你这一句发言："
+        f"轮到你（{player.seat}号）了，直接说你这一句发言："
     )
 
     raw = await llm.chat(system, user)
@@ -246,13 +246,13 @@ _WOLF_CHAT_FALLBACK = [
 
 async def wolf_chat(player: Player, mates: list[Player], state: GameState) -> str:
     """NPC 狼人在狼人私密频道里和队友商量一句（只有狼能看到）。"""
-    mate_txt = "、".join(f"{m.seat}号{m.name}" for m in mates) if mates else "（暂无）"
+    mate_txt = "、".join(f"{m.seat}号" for m in mates) if mates else "（暂无）"
     good_targets = "、".join(
-        f"{p.seat}号{p.name}" for p in state.alive_players if not (p.role and p.role.is_wolf)
+        f"{p.seat}号" for p in state.alive_players if not (p.role and p.role.is_wolf)
     )
     system = (
         "你正在玩中文《狼人杀》，你是狼人，现在在只有狼队友能看到的私密狼人频道里商量今晚刀谁。"
-        f"你是【{player.seat}号·{player.name}】，性格「{player.persona}」。"
+        f"你是【{player.seat}号】，性格「{player.persona}」。"
         "像真人在狼队小群里聊天：简短、直接、商量口吻，可以提议刀某个具体的人或问队友意见。"
         "只说 1~2 句、15~45 字；不要加引号、不要写名字前缀、不要 markdown。"
     )
@@ -281,14 +281,14 @@ async def last_word(player: Player, state: GameState) -> str:
     secret = _role_brief(player, state)
     system = (
         "你正在玩中文《狼人杀》，扮演一名刚刚出局的玩家，现在留一句简短遗言，绝不承认自己是 AI。"
-        f"你是【{player.seat}号·{player.name}】，性格「{player.persona}」。"
+        f"你是【{player.seat}号】，性格「{player.persona}」。"
         "遗言要贴合身份与性格：好人可以喊话、提醒站边、给信息；狼人可以继续伪装或卖好人。"
         "只说 1~2 句、15~50 字，口语化；不要加引号、不要写名字前缀、不要用 markdown。"
     )
     user = (
         f"【只有你知道的秘密】{secret}\n"
         f"存活玩家：{_alive_roster(state)}。\n"
-        f"你（{player.seat}号·{player.name}）刚出局了，留一句遗言："
+        f"你（{player.seat}号）刚出局了，留一句遗言："
     )
     raw = await llm.chat(system, user, max_tokens=120)
     cleaned = _clean_speech(raw, player)

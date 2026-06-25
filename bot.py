@@ -35,6 +35,10 @@ games: dict[int, GameState] = {}
 REVEAL_SECONDS = config.REVEAL_SECONDS
 TURN = config.TURN_SECONDS
 
+# 子区慢速模式：Discord 慢速上限为 6 小时（21600 秒）。开到最大，
+# 配合面板模式的统一禁言，确保玩家无法在子区里自由打字发言。
+THREAD_SLOWMODE_SECONDS = 21600
+
 # 颜色
 C_NIGHT = 0x2B2D31
 C_DAY = 0xFEE75C
@@ -98,7 +102,8 @@ class RoleRevealView(discord.ui.View):
         if p is None or p.role is None:
             await interaction.response.send_message("你不在本局游戏里。", ephemeral=True)
             return
-        text = f"你的身份：{p.role.emoji} **{p.role.cn}**\n{p.role.description}"
+        text = (f"你的座位号：**{p.seat}号**（全程匿名，大家只看得到座位号）\n"
+                f"你的身份：{p.role.emoji} **{p.role.cn}**\n{p.role.description}")
         if p.role is Role.WEREWOLF:
             mates = [m.label for m in self.state.players
                      if m.role is Role.WEREWOLF and m.uid != p.uid]
@@ -257,41 +262,43 @@ class WitchActionView(discord.ui.View):
         self.add_item(self._SkipButton(self))
 
     class _HealButton(discord.ui.Button):
-        def __init__(self, parent):
-            super().__init__(label=f"用解药救 {parent.victim.label}", style=discord.ButtonStyle.success, emoji="💉")
-            self.parent = parent
+        # 注意：不要用 self.parent —— discord.py 2.4+ 的 UI 组件已有只读属性 `parent`，
+        # 赋值会抛 AttributeError 导致整个女巫面板构造失败（表现为「交互失败」）。
+        def __init__(self, owner):
+            super().__init__(label=f"用解药救 {owner.victim.label}", style=discord.ButtonStyle.success, emoji="💉")
+            self.owner = owner
 
         async def callback(self, interaction: discord.Interaction):
-            self.parent.result["heal"] = True
-            self.parent.witch.has_heal = False
-            self.parent.done.set()
+            self.owner.result["heal"] = True
+            self.owner.witch.has_heal = False
+            self.owner.done.set()
             await interaction.response.edit_message(
-                content=f"💉 你使用了**解药**，救活了 {self.parent.victim.label}。", view=None
+                content=f"💉 你使用了**解药**，救活了 {self.owner.victim.label}。", view=None
             )
 
     class _PoisonSelect(discord.ui.Select):
-        def __init__(self, parent):
+        def __init__(self, owner):
             options = [discord.SelectOption(label=p.label, value=str(p.uid))
-                       for p in parent.state.alive_players if p.uid != parent.witch.uid]
+                       for p in owner.state.alive_players if p.uid != owner.witch.uid]
             super().__init__(placeholder="🧪 用毒药毒死…", min_values=1, max_values=1, options=options)
-            self.parent = parent
+            self.owner = owner
 
         async def callback(self, interaction: discord.Interaction):
             uid = int(self.values[0])
-            self.parent.result["poison"] = uid
-            self.parent.witch.has_poison = False
-            self.parent.done.set()
+            self.owner.result["poison"] = uid
+            self.owner.witch.has_poison = False
+            self.owner.done.set()
             await interaction.response.edit_message(
-                content=f"🧪 你使用了**毒药**，毒死了 {self.parent.state.get(uid).label}。", view=None
+                content=f"🧪 你使用了**毒药**，毒死了 {self.owner.state.get(uid).label}。", view=None
             )
 
     class _SkipButton(discord.ui.Button):
-        def __init__(self, parent):
+        def __init__(self, owner):
             super().__init__(label="今晚不行动", style=discord.ButtonStyle.secondary, emoji="🙅")
-            self.parent = parent
+            self.owner = owner
 
         async def callback(self, interaction: discord.Interaction):
-            self.parent.done.set()
+            self.owner.done.set()
             await interaction.response.edit_message(content="🙅 你今晚选择不使用药剂。", view=None)
 
 
@@ -685,13 +692,13 @@ async def collect_last_words(state: GameState, panel: Panel, channel, player) ->
                           input_label="留下你的遗言（可留空）", timeout=30)
     await panel.show(
         title="🪦 遗言",
-        desc=f"{player.mention} 出局了，请在 **30 秒**内点按钮留下遗言。",
+        desc=f"**{player.label}** 出局了，请在 **30 秒**内点按钮留下遗言。",
         color=C_DAY, view=view,
     )
     try:
         text = await asyncio.wait_for(fut, timeout=30)
         if text.strip():
-            await channel.send(f"🪦 **{player.label}** 的遗言：{text}")
+            await channel.send(f"🪦 **{player.label}** 的遗言：{text}")  # label 已是匿名座位号
         else:
             await channel.send(f"（{player.label} 没有留下遗言。）")
     except asyncio.TimeoutError:
@@ -712,7 +719,7 @@ async def announce_deaths(state: GameState, panel: Panel, channel, deaths: list,
     await panel.show(title="🌅 第 %d 天 · 天亮了" % state.day_count,
                      desc=f"昨晚倒下的是：**{names}**。\n\n" + roster_block(state), color=C_DAY)
     for d in deaths:
-        day_log.append(f"第{state.day_count}晚，{d.name}出局。")
+        day_log.append(f"第{state.day_count}晚，{d.seat}号出局。")
     await asyncio.sleep(1.5)
     for d in deaths:
         await collect_last_words(state, panel, channel, d)
@@ -734,7 +741,7 @@ async def phase_discussion(bot, state: GameState, panel: Panel, channel, day_log
             await channel.typing()
             speech = await npc.speak(player, state, day_log)
             await channel.send(f"💬 **{player.label}**：{speech}")
-            day_log.append(f"{player.seat}号{player.name}: {speech}")
+            day_log.append(f"{player.seat}号: {speech}")
             await asyncio.sleep(1.2)
         else:
             loop = asyncio.get_running_loop()
@@ -744,7 +751,7 @@ async def phase_discussion(bot, state: GameState, panel: Panel, channel, day_log
                                   input_label="输入你的发言", timeout=TURN)
             await panel.show(
                 title="☀️ 第 %d 天 · 讨论" % state.day_count,
-                desc=(f"🎤 现在轮到 **{player.seat}号** {player.mention} 发言。\n"
+                desc=(f"🎤 现在轮到 **{player.seat}号** 发言（请对号入座，只有本人能点发言）。\n"
                       f"请在 **{TURN} 秒**内点下方按钮输入发言（其他人请稍候）。\n\n"
                       f"📋 顺序：{order_txt}"),
                 color=C_DAY, view=view, footer="点『我要发言』弹出输入框",
@@ -753,13 +760,13 @@ async def phase_discussion(bot, state: GameState, panel: Panel, channel, day_log
                 text = await asyncio.wait_for(fut, timeout=TURN)
                 if text.strip():
                     await channel.send(f"💬 **{player.label}**：{text}")
-                    day_log.append(f"{player.seat}号{player.name}: {text}")
+                    day_log.append(f"{player.seat}号: {text}")
                 else:
                     await channel.send(f"（{player.label} 选择不发言。）")
-                    day_log.append(f"{player.seat}号{player.name}: （沉默）")
+                    day_log.append(f"{player.seat}号: （沉默）")
             except asyncio.TimeoutError:
                 await channel.send(f"（{player.label} 超时，跳过发言）")
-                day_log.append(f"{player.seat}号{player.name}: （沉默/超时）")
+                day_log.append(f"{player.seat}号: （沉默/超时）")
             finally:
                 state.current_speaker_uid = None
                 view.stop()
@@ -812,7 +819,7 @@ async def phase_vote(bot, state: GameState, panel: Panel, channel, day_log: list
     else:
         await channel.send(
             f"🔨 **{exiled.label}** 被放逐出局，身份是 {exiled.role.emoji}**{exiled.role.cn}**。")
-        day_log.append(f"{exiled.name} 被投票放逐，身份是{exiled.role.cn}。")
+        day_log.append(f"{exiled.seat}号 被投票放逐，身份是{exiled.role.cn}。")
         await collect_last_words(state, panel, channel, exiled)
 
 
@@ -919,6 +926,7 @@ async def new_game(interaction: discord.Interaction):
                 name=f"🐺 狼人杀 · {interaction.user.display_name}",
                 type=discord.ChannelType.private_thread,
                 invitable=False, auto_archive_duration=1440,
+                slowmode_delay=THREAD_SLOWMODE_SECONDS,
             )
             await thread.add_user(interaction.user)
             await thread.send(

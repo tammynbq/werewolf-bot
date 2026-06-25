@@ -35,7 +35,10 @@ class Player:
 
     @property
     def label(self) -> str:
-        """纯文本展示名（不触发提及），用于列表 / 投票面板。"""
+        """匿名展示名：开局分配座位后只显示座位号（如「5号」），
+        不暴露真实昵称，也不区分真人/NPC，做到全程匿名。
+        座位未分配（大厅阶段）时退回到名字以便辨认。"""
+        if self.seat:
+            return f"{self.seat}号"
         prefix = "🤖" if self.is_npc else "🧑"
-        seat = f"{self.seat}号·" if self.seat else ""
-        return f"{seat}{prefix}{self.name}"
+        return f"{prefix}{self.name}"
