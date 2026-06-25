@@ -34,11 +34,12 @@ class GameState:
         self.thread_id: int | None = None
         # 游戏实际进行的频道/讨论串 id；发言管控只作用于此
         self.play_channel_id: int | None = None
-        # 白天轮流发言阶段：是否启用「只有当前发言人能说话」
-        self.discussion_active: bool = False
+        # 狼人专属私密线程 id（夜里狼队私聊用）
+        self.wolf_thread_id: int | None = None
+        # 面板模式：全程统一禁言，只有「当前发言/行动人」能通过面板操作
         self.current_speaker_uid: int | None = None
-        # 每晚的临时记录
-        self.last_killed: Player | None = None
+        # 每晚的死亡记录（可能 0~2 人：狼刀 + 女巫毒）
+        self.night_deaths: list[Player] = []
 
     # ---------- 玩家管理 ----------
     def get(self, uid: int) -> Player | None:
@@ -71,6 +72,12 @@ class GameState:
     def alive_villagers(self) -> list[Player]:
         return [p for p in self.alive_players if p.role and not p.role.is_wolf]
 
+    def alive_seer(self) -> Player | None:
+        return next((p for p in self.alive_players if p.role is Role.SEER), None)
+
+    def alive_witch(self) -> Player | None:
+        return next((p for p in self.alive_players if p.role is Role.WITCH), None)
+
     # ---------- 开局 ----------
     def assign_roles(self) -> None:
         """打乱并分配角色。"""
@@ -85,17 +92,38 @@ class GameState:
         self.day_count = 0
 
     # ---------- 夜晚结算 ----------
-    def resolve_night(self, kill_uid: int | None) -> Player | None:
-        """根据狼队的击杀目标结算夜晚，返回被杀玩家（可能为 None=空刀）。"""
-        self.last_killed = None
-        if kill_uid is not None:
+    def resolve_night(
+        self,
+        kill_uid: int | None,
+        witch_heal: bool = False,
+        poison_uid: int | None = None,
+    ) -> list[Player]:
+        """结算夜晚，返回本晚死亡的玩家列表（0~2 人）。
+
+        kill_uid    狼队击杀目标（None / 0 = 空刀）。
+        witch_heal  女巫是否对狼刀目标使用了解药（救活）。
+        poison_uid  女巫毒药目标（None = 没毒）。
+        """
+        deaths: list[Player] = []
+
+        # 狼刀（女巫救则作废）
+        if kill_uid:
             victim = self.get(kill_uid)
-            if victim and victim.alive:
+            if victim and victim.alive and not witch_heal:
                 victim.alive = False
-                self.last_killed = victim
+                deaths.append(victim)
+
+        # 女巫毒药
+        if poison_uid:
+            poisoned = self.get(poison_uid)
+            if poisoned and poisoned.alive and poisoned not in deaths:
+                poisoned.alive = False
+                deaths.append(poisoned)
+
+        self.night_deaths = deaths
         self.day_count += 1
         self.phase = Phase.DAY
-        return self.last_killed
+        return deaths
 
     # ---------- 投票结算 ----------
     def resolve_votes(self, votes: dict[int, int]) -> tuple[Player | None, bool]:

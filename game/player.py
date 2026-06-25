@@ -22,6 +22,10 @@ class Player:
     # 预言家的查验记录： {目标 uid: 是否为狼}
     seer_results: dict[int, bool] = field(default_factory=dict)
 
+    # 女巫的药剂（各一次）：解药 / 毒药是否还在
+    has_heal: bool = True
+    has_poison: bool = True
+
     @property
     def mention(self) -> str:
         """在 Discord 里展示用：人类用 @提及，NPC 用名字。"""

@@ -74,6 +74,28 @@ def seer_check_target(seer: Player, state: GameState) -> int | None:
     return random.choice(candidates).uid
 
 
+def witch_night_action(
+    witch: Player, state: GameState, victim_uid: int | None
+) -> tuple[bool, int | None]:
+    """NPC 女巫夜晚决策，返回 (是否用解药救, 毒药目标 uid 或 None)。
+
+    规则（保守、像个谨慎的好人）：
+    - 有解药且今晚有人被刀、且被刀的不是自己 → 50% 概率救。
+    - 没救人时，有毒药 → 20% 概率毒一名随机存活玩家（不毒自己）。
+    - 同一晚不会既救又毒。
+    """
+    heal = False
+    if witch.has_heal and victim_uid and victim_uid != witch.uid:
+        heal = random.random() < 0.5
+
+    poison_uid = None
+    if not heal and witch.has_poison and random.random() < 0.2:
+        others = [p for p in state.alive_players if p.uid != witch.uid]
+        if others:
+            poison_uid = random.choice(others).uid
+    return heal, poison_uid
+
+
 def vote_target(voter: Player, state: GameState) -> int | None:
     """投票决策：
     - 狼人：投一名存活好人（不投队友）。
@@ -125,6 +147,11 @@ def _role_brief(player: Player, state: GameState) -> str:
             lines.append("你的查验结果：" + "；".join(checked) + "。可以选择性地报验或隐藏。")
         else:
             lines.append("你还没有查验结果。")
+    elif player.role is Role.WITCH:
+        potions = []
+        potions.append("解药" + ("还在" if player.has_heal else "已用"))
+        potions.append("毒药" + ("还在" if player.has_poison else "已用"))
+        lines.append("你是好人阵营，" + "、".join(potions) + "。注意别暴露女巫身份被狼针对。")
     return " ".join(lines)
 
 
@@ -207,6 +234,38 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
     if len(cleaned) >= 4:
         return cleaned
     return random.choice(_FALLBACK_LINES)
+
+
+_WOLF_CHAT_FALLBACK = [
+    "我觉得先刀那个看起来像神的，别留预言家。",
+    "稳一点，今晚别空刀，挑个话多的好人下手。",
+    "你想刀谁？我都行，听你的。",
+    "别冲动，先想想明天怎么洗，刀完得对口供。",
+]
+
+
+async def wolf_chat(player: Player, mates: list[Player], state: GameState) -> str:
+    """NPC 狼人在狼人私密频道里和队友商量一句（只有狼能看到）。"""
+    mate_txt = "、".join(f"{m.seat}号{m.name}" for m in mates) if mates else "（暂无）"
+    good_targets = "、".join(
+        f"{p.seat}号{p.name}" for p in state.alive_players if not (p.role and p.role.is_wolf)
+    )
+    system = (
+        "你正在玩中文《狼人杀》，你是狼人，现在在只有狼队友能看到的私密狼人频道里商量今晚刀谁。"
+        f"你是【{player.seat}号·{player.name}】，性格「{player.persona}」。"
+        "像真人在狼队小群里聊天：简短、直接、商量口吻，可以提议刀某个具体的人或问队友意见。"
+        "只说 1~2 句、15~45 字；不要加引号、不要写名字前缀、不要 markdown。"
+    )
+    user = (
+        f"你的狼队友：{mate_txt}。\n"
+        f"可以刀的好人：{good_targets}。\n"
+        "说一句你和队友商量今晚刀谁的话："
+    )
+    raw = await llm.chat(system, user, max_tokens=100)
+    cleaned = _clean_speech(raw, player)
+    if len(cleaned) >= 4:
+        return cleaned
+    return random.choice(_WOLF_CHAT_FALLBACK)
 
 
 _LAST_WORD_FALLBACK = [

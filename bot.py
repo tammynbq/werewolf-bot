@@ -1,7 +1,13 @@
-"""Discord 狼人杀 bot —— 交互层。
+"""Discord 狼人杀 bot —— 面板模式交互层。
 
-负责：slash 命令、大厅加入、NPC 补位开局、夜晚 DM 行动、白天发言与投票 UI，
-以及驱动整局游戏流程。核心规则在 game/ 包，NPC 在 npc.py，LLM 在 llm.py。
+设计要点：
+- **全程单一面板**：一条 embed 消息随阶段更新（身份确认 → 天黑 → 预言家 → 狼人 → 女巫
+  → 天亮 → 发言 → 投票 → 结算）。
+- **统一禁言**：游戏频道里所有人默认不能直接打字（消息会被删），一切通过面板按钮进行；
+  轮到你说话时，点面板按钮弹出输入框打字，提交后大家才看到。
+- **狼人私密线程**：狼队有专属的私密频道，夜里可看到队友并实时商量，NPC 狼也会发言。
+
+核心规则在 game/ 包，NPC 在 npc.py，LLM 在 llm.py。
 """
 from __future__ import annotations
 
@@ -26,133 +32,67 @@ log = logging.getLogger("werewolf.bot")
 # 每个频道一局：channel_id -> GameState
 games: dict[int, GameState] = {}
 
-# 开局后留给玩家查看身份的秒数
 REVEAL_SECONDS = config.REVEAL_SECONDS
+TURN = config.TURN_SECONDS
+
+# 颜色
+C_NIGHT = 0x2B2D31
+C_DAY = 0xFEE75C
+C_INFO = 0x5865F2
+C_WIN_WOLF = 0xED4245
+C_WIN_GOOD = 0x57F287
 
 
 # ============================================================
-# UI 组件
+# 面板：一条随阶段更新的 embed 消息
 # ============================================================
-class NightActions:
-    """一夜之中收集到的人类/NPC 行动（共享给各 ephemeral 菜单写入）。"""
+class Panel:
+    def __init__(self, channel):
+        self.channel = channel
+        self.message: discord.Message | None = None
 
-    def __init__(self, expected: set[int]):
-        self.wolf_votes: dict[int, int] = {}   # 狼 uid -> 击杀目标 uid
-        self.acted: set[int] = set()           # 本夜已完成行动的玩家 uid
-        self.expected = expected               # 需要等待行动的人类 uid（狼+预言家）
-        self.done = asyncio.Event()
-
-    def mark(self, uid: int) -> None:
-        self.acted.add(uid)
-        if self.expected and self.expected <= self.acted:
-            self.done.set()  # 所有该行动的人都点完了，提前结束等待
-
-
-class WolfKillSelect(discord.ui.Select):
-    """狼人在 ephemeral 菜单里选择击杀目标。"""
-
-    def __init__(self, wolf, state: GameState, actions: NightActions):
-        options = [discord.SelectOption(label="🌙 空刀（今晚不杀人）", value="0")] + [
-            discord.SelectOption(label=p.label, value=str(p.uid))
-            for p in state.alive_players if not (p.role and p.role.is_wolf)
-        ]
-        super().__init__(placeholder="选择今晚击杀的目标…", min_values=1, max_values=1, options=options)
-        self._wolf = wolf
-        self._state = state
-        self._actions = actions
-
-    async def callback(self, interaction: discord.Interaction):
-        val = int(self.values[0])
-        self._actions.wolf_votes[self._wolf.uid] = val  # 0 = 空刀
-        self._actions.mark(self._wolf.uid)
-        if val == 0:
-            content = "🐺 你选择**今晚空刀**（不杀人）。（可重新点按钮修改）"
+    async def show(self, *, title: str, desc: str, color: int,
+                   view: discord.ui.View | None = None, footer: str | None = None):
+        embed = discord.Embed(title=title, description=desc, color=color)
+        if footer:
+            embed.set_footer(text=footer)
+        if self.message is None:
+            self.message = await self.channel.send(embed=embed, view=view)
         else:
-            target = self._state.get(val)
-            content = f"🐺 你选择击杀 **{target.label}**。（可重新点按钮修改）"
-        await interaction.response.edit_message(content=content, view=None)
+            # view=None 时清掉旧按钮，避免上一个阶段的按钮残留可点
+            await self.message.edit(embed=embed, view=view)
 
 
-class SeerCheckSelect(discord.ui.Select):
-    """预言家在 ephemeral 菜单里选择查验目标，立即回报结果。"""
-
-    def __init__(self, seer, state: GameState, actions: NightActions):
-        options = [
-            discord.SelectOption(label=p.label, value=str(p.uid))
-            for p in state.alive_players if p.uid != seer.uid
-        ]
-        super().__init__(placeholder="选择今晚查验的对象…", min_values=1, max_values=1, options=options)
-        self._seer = seer
-        self._state = state
-        self._actions = actions
-
-    async def callback(self, interaction: discord.Interaction):
-        target = self._state.get(int(self.values[0]))
-        is_wolf = bool(target.role and target.role.is_wolf)
-        self._seer.seer_results[target.uid] = is_wolf
-        self._actions.mark(self._seer.uid)
-        verdict = "🐺 狼人" if is_wolf else "✅ 好人"
-        await interaction.response.edit_message(
-            content=f"🔮 查验结果：**{target.label}** 是 {verdict}", view=None
-        )
+def roster_block(state: GameState) -> str:
+    """存活玩家清单（带座位号），夜晚/白天面板都用。"""
+    lines = []
+    for p in state.players:
+        mark = "🟢" if p.alive else "⚫"
+        lines.append(f"{mark} {p.label}")
+    return "\n".join(lines)
 
 
-class RoleActionView(discord.ui.View):
-    """点「夜晚行动」后，根据身份给出的 ephemeral 菜单。"""
-
-    def __init__(self, player, state: GameState, actions: NightActions, timeout: int):
-        super().__init__(timeout=timeout)
-        if player.role is Role.WEREWOLF:
-            self.add_item(WolfKillSelect(player, state, actions))
-        elif player.role is Role.SEER:
-            self.add_item(SeerCheckSelect(player, state, actions))
+async def wait_event(event: asyncio.Event, timeout: int) -> None:
+    try:
+        await asyncio.wait_for(event.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pass
 
 
-class NightPanelView(discord.ui.View):
-    """夜晚公开面板：一个按钮，按下后只给本人看 ephemeral 行动菜单。"""
-
-    def __init__(self, state: GameState, actions: NightActions, timeout: int):
-        super().__init__(timeout=timeout)
-        self.state = state
-        self.actions = actions
-
-    @discord.ui.button(label="进行夜晚行动", style=discord.ButtonStyle.primary, emoji="🌙")
-    async def act(self, interaction: discord.Interaction, button: discord.ui.Button):
-        p = self.state.get(interaction.user.id)
-        if p is None:
-            await interaction.response.send_message("你不在本局游戏里。", ephemeral=True)
-            return
-        if not p.alive:
-            await interaction.response.send_message("你已经出局，无法行动。", ephemeral=True)
-            return
-        if p.role is Role.WEREWOLF:
-            mates = [
-                m.label for m in self.state.players
-                if m.role is Role.WEREWOLF and m.uid != p.uid
-            ]
-            mate_txt = "队友：" + "、".join(mates) if mates else "你是本局唯一的狼"
-            content = f"🐺 你是**狼人**（{mate_txt}）。选择今晚击杀目标："
-        elif p.role is Role.SEER:
-            content = "🔮 你是**预言家**。选择今晚要查验的对象："
-        else:
-            await interaction.response.send_message(
-                "👤 你是**平民**，今晚没有行动，安心睡觉～", ephemeral=True
-            )
-            return
-        await interaction.response.send_message(
-            content, view=RoleActionView(p, self.state, self.actions, button.view.timeout or 60),
-            ephemeral=True,
-        )
-
-
+# ============================================================
+# 身份确认面板
+# ============================================================
 class RoleRevealView(discord.ui.View):
-    """身份查看面板：每个人点按钮，只给自己看到身份。"""
+    """每个人点按钮只给自己看身份；全部真人确认后自动天黑。"""
 
-    def __init__(self, state: GameState, timeout: int):
+    def __init__(self, state: GameState, panel: Panel, done: asyncio.Event, timeout: int):
         super().__init__(timeout=timeout)
         self.state = state
+        self.panel = panel
+        self.done = done
+        self.confirmed: set[int] = set()
 
-    @discord.ui.button(label="查看我的身份", style=discord.ButtonStyle.secondary, emoji="🔍")
+    @discord.ui.button(label="查看我的身份", style=discord.ButtonStyle.primary, emoji="🔍")
     async def reveal(self, interaction: discord.Interaction, button: discord.ui.Button):
         p = self.state.get(interaction.user.id)
         if p is None or p.role is None:
@@ -160,23 +100,279 @@ class RoleRevealView(discord.ui.View):
             return
         text = f"你的身份：{p.role.emoji} **{p.role.cn}**\n{p.role.description}"
         if p.role is Role.WEREWOLF:
-            mates = [
-                m.label for m in self.state.players
-                if m.role is Role.WEREWOLF and m.uid != p.uid
-            ]
+            mates = [m.label for m in self.state.players
+                     if m.role is Role.WEREWOLF and m.uid != p.uid]
             text += "\n\n🐺 你的狼队友：" + ("、".join(mates) if mates else "无（你是独狼）")
+            text += "\n夜里点面板的『狼人行动』即可进入狼人频道和队友商量。"
         await interaction.response.send_message(text, ephemeral=True)
 
+        self.confirmed.add(p.uid)
+        humans = {h.uid for h in self.state.humans}
+        await self._refresh(len(humans))
+        if humans and self.confirmed >= humans:
+            self.done.set()
 
+    async def _refresh(self, total_humans: int):
+        try:
+            await self.panel.show(
+                title="🎬 游戏开始 · 确认身份",
+                desc=(f"请各位点下方按钮查看自己的身份（只有你自己可见）。\n"
+                      f"全部真人确认后将自动天黑。\n\n{roster_block(self.state)}"),
+                color=C_INFO,
+                view=self,
+                footer=f"已确认 {len(self.confirmed)}/{total_humans} 名真人玩家",
+            )
+        except discord.HTTPException:
+            pass
+
+
+# ============================================================
+# 夜晚 · 预言家
+# ============================================================
+class SeerCheckSelect(discord.ui.Select):
+    def __init__(self, seer, state: GameState, done: asyncio.Event):
+        options = [discord.SelectOption(label=p.label, value=str(p.uid))
+                   for p in state.alive_players if p.uid != seer.uid]
+        super().__init__(placeholder="选择今晚查验的对象…", min_values=1, max_values=1, options=options)
+        self._seer = seer
+        self._state = state
+        self._done = done
+
+    async def callback(self, interaction: discord.Interaction):
+        target = self._state.get(int(self.values[0]))
+        is_wolf = bool(target.role and target.role.is_wolf)
+        self._seer.seer_results[target.uid] = is_wolf
+        verdict = "🐺 狼人" if is_wolf else "✅ 好人"
+        self._done.set()
+        await interaction.response.edit_message(
+            content=f"🔮 查验结果：**{target.label}** 是 {verdict}", view=None
+        )
+
+
+class SeerGateView(discord.ui.View):
+    def __init__(self, state: GameState, done: asyncio.Event, timeout: int):
+        super().__init__(timeout=timeout)
+        self.state = state
+        self.done = done
+
+    @discord.ui.button(label="预言家查验", style=discord.ButtonStyle.primary, emoji="🔮")
+    async def act(self, interaction: discord.Interaction, button: discord.ui.Button):
+        seer = self.state.alive_seer()
+        if seer is None or seer.uid != interaction.user.id:
+            await interaction.response.send_message(
+                "🌙 天黑了，请闭眼等待预言家行动。", ephemeral=True
+            )
+            return
+        view = discord.ui.View(timeout=self.timeout)
+        view.add_item(SeerCheckSelect(seer, self.state, self.done))
+        await interaction.response.send_message(
+            "🔮 你是**预言家**，选择今晚查验的对象：", view=view, ephemeral=True
+        )
+
+
+# ============================================================
+# 夜晚 · 狼人
+# ============================================================
+class WolfKillSelect(discord.ui.Select):
+    def __init__(self, wolf, state: GameState, votes: dict[int, int],
+                 expected: set[int], done: asyncio.Event):
+        options = [discord.SelectOption(label="🌙 空刀（今晚不杀人）", value="0")] + [
+            discord.SelectOption(label=p.label, value=str(p.uid))
+            for p in state.alive_players if not (p.role and p.role.is_wolf)
+        ]
+        super().__init__(placeholder="选择今晚击杀的目标…", min_values=1, max_values=1, options=options)
+        self._wolf = wolf
+        self._state = state
+        self._votes = votes
+        self._expected = expected
+        self._done = done
+
+    async def callback(self, interaction: discord.Interaction):
+        val = int(self.values[0])
+        self._votes[self._wolf.uid] = val
+        if val == 0:
+            content = "🐺 你选择**今晚空刀**。（可重选覆盖）"
+        else:
+            content = f"🐺 你选择击杀 **{self._state.get(val).label}**。（可重选覆盖）"
+        if self._expected and self._expected <= set(self._votes.keys()):
+            self._done.set()
+        await interaction.response.edit_message(content=content, view=None)
+
+
+class WolfGateView(discord.ui.View):
+    """夜晚面板上的『狼人行动』按钮：进入狼人私密频道 + 选刀。"""
+
+    def __init__(self, bot, state: GameState, votes: dict[int, int],
+                 expected: set[int], done: asyncio.Event, timeout: int):
+        super().__init__(timeout=timeout)
+        self.bot = bot
+        self.state = state
+        self.votes = votes
+        self.expected = expected
+        self.done = done
+
+    @discord.ui.button(label="狼人行动", style=discord.ButtonStyle.danger, emoji="🐺")
+    async def act(self, interaction: discord.Interaction, button: discord.ui.Button):
+        p = self.state.get(interaction.user.id)
+        if p is None or not p.alive or p.role is not Role.WEREWOLF:
+            await interaction.response.send_message(
+                "🌙 天黑了，请闭眼等待。", ephemeral=True
+            )
+            return
+        mates = [m for m in self.state.alive_wolves() if m.uid != p.uid]
+        mate_txt = "、".join(m.label for m in mates) if mates else "无（你是独狼）"
+        thread = self.bot.get_channel(self.state.wolf_thread_id) if self.state.wolf_thread_id else None
+        thread_hint = f"\n👉 去 {thread.mention} 和队友商量。" if isinstance(thread, discord.Thread) else ""
+        try:
+            if isinstance(thread, discord.Thread):
+                await thread.add_user(interaction.user)
+        except discord.HTTPException:
+            pass
+        view = discord.ui.View(timeout=self.timeout)
+        view.add_item(WolfKillSelect(p, self.state, self.votes, self.expected, self.done))
+        await interaction.response.send_message(
+            f"🐺 你是**狼人**，队友：{mate_txt}。{thread_hint}\n选择今晚击杀目标：",
+            view=view, ephemeral=True,
+        )
+
+
+# ============================================================
+# 夜晚 · 女巫
+# ============================================================
+class WitchActionView(discord.ui.View):
+    """女巫私有面板：解药救人 / 毒药毒人 / 不行动。"""
+
+    def __init__(self, witch, state: GameState, victim, result: dict, done: asyncio.Event, timeout: int):
+        super().__init__(timeout=timeout)
+        self.witch = witch
+        self.state = state
+        self.victim = victim
+        self.result = result  # {"heal": bool, "poison": uid|None}
+        self.done = done
+
+        if witch.has_heal and victim is not None:
+            self.add_item(self._HealButton(self))
+        if witch.has_poison:
+            self.add_item(self._PoisonSelect(self))
+        self.add_item(self._SkipButton(self))
+
+    class _HealButton(discord.ui.Button):
+        def __init__(self, parent):
+            super().__init__(label=f"用解药救 {parent.victim.label}", style=discord.ButtonStyle.success, emoji="💉")
+            self.parent = parent
+
+        async def callback(self, interaction: discord.Interaction):
+            self.parent.result["heal"] = True
+            self.parent.witch.has_heal = False
+            self.parent.done.set()
+            await interaction.response.edit_message(
+                content=f"💉 你使用了**解药**，救活了 {self.parent.victim.label}。", view=None
+            )
+
+    class _PoisonSelect(discord.ui.Select):
+        def __init__(self, parent):
+            options = [discord.SelectOption(label=p.label, value=str(p.uid))
+                       for p in parent.state.alive_players if p.uid != parent.witch.uid]
+            super().__init__(placeholder="🧪 用毒药毒死…", min_values=1, max_values=1, options=options)
+            self.parent = parent
+
+        async def callback(self, interaction: discord.Interaction):
+            uid = int(self.values[0])
+            self.parent.result["poison"] = uid
+            self.parent.witch.has_poison = False
+            self.parent.done.set()
+            await interaction.response.edit_message(
+                content=f"🧪 你使用了**毒药**，毒死了 {self.parent.state.get(uid).label}。", view=None
+            )
+
+    class _SkipButton(discord.ui.Button):
+        def __init__(self, parent):
+            super().__init__(label="今晚不行动", style=discord.ButtonStyle.secondary, emoji="🙅")
+            self.parent = parent
+
+        async def callback(self, interaction: discord.Interaction):
+            self.parent.done.set()
+            await interaction.response.edit_message(content="🙅 你今晚选择不使用药剂。", view=None)
+
+
+class WitchGateView(discord.ui.View):
+    def __init__(self, state: GameState, victim, result: dict, done: asyncio.Event, timeout: int):
+        super().__init__(timeout=timeout)
+        self.state = state
+        self.victim = victim
+        self.result = result
+        self.done = done
+
+    @discord.ui.button(label="女巫行动", style=discord.ButtonStyle.primary, emoji="🧪")
+    async def act(self, interaction: discord.Interaction, button: discord.ui.Button):
+        witch = self.state.alive_witch()
+        if witch is None or witch.uid != interaction.user.id:
+            await interaction.response.send_message(
+                "🌙 天黑了，请闭眼等待女巫行动。", ephemeral=True
+            )
+            return
+        if self.victim is not None:
+            info = f"今晚 **{self.victim.label}** 倒下了。"
+        else:
+            info = "今晚是平安夜，暂时无人被刀。"
+        await interaction.response.send_message(
+            f"🧪 你是**女巫**。{info}\n请选择你的行动：",
+            view=WitchActionView(witch, self.state, self.victim, self.result, self.done, self.timeout or TURN),
+            ephemeral=True,
+        )
+
+
+# ============================================================
+# 发言 / 遗言：面板按钮 → 弹窗输入
+# ============================================================
+class SpeechModal(discord.ui.Modal):
+    def __init__(self, title: str, label: str, fut: asyncio.Future):
+        super().__init__(title=title)
+        self._fut = fut
+        self.text = discord.ui.TextInput(
+            label=label, style=discord.TextStyle.paragraph,
+            max_length=400, required=False, placeholder="在这里输入，提交后大家才能看到…",
+        )
+        self.add_item(self.text)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.send_message("✅ 已发送。", ephemeral=True)
+        if not self._fut.done():
+            self._fut.set_result(self.text.value or "")
+
+
+class SpeechGateView(discord.ui.View):
+    """只有当前轮到的玩家能点按钮弹出输入框。"""
+
+    def __init__(self, player, fut: asyncio.Future, btn_label: str, modal_title: str,
+                 input_label: str, timeout: int):
+        super().__init__(timeout=timeout)
+        self.player = player
+        self.fut = fut
+        self.modal_title = modal_title
+        self.input_label = input_label
+        # 动态改按钮文字（children[0] 即下面这个按钮）
+        self.children[0].label = btn_label
+
+    @discord.ui.button(label="发言", style=discord.ButtonStyle.primary, emoji="✍️")
+    async def _btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.player.uid:
+            await interaction.response.send_message(
+                "⏳ 还没轮到你，请等点到你时再操作。", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(
+            SpeechModal(self.modal_title, self.input_label, self.fut)
+        )
+
+
+# ============================================================
+# 投票面板
+# ============================================================
 class VoteSelect(discord.ui.Select):
-    """白天公开投票（共享，多个存活玩家都能投）。"""
-
-    def __init__(self, options: list[tuple[str, str]], allowed_ids: set[int],
-                 votes: dict[int, int], parent: "VoteView"):
+    def __init__(self, options, allowed_ids: set[int], votes: dict[int, int], parent):
         super().__init__(
-            placeholder="选择要放逐的玩家…",
-            min_values=1,
-            max_values=1,
+            placeholder="选择要放逐的玩家…", min_values=1, max_values=1,
             options=[discord.SelectOption(label=l, value=v) for l, v in options],
         )
         self._allowed = allowed_ids
@@ -185,22 +381,16 @@ class VoteSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id not in self._allowed:
-            await interaction.response.send_message(
-                "你不是存活玩家，不能投票。", ephemeral=True
-            )
+            await interaction.response.send_message("你不是存活玩家，不能投票。", ephemeral=True)
             return
         self._votes[interaction.user.id] = int(self.values[0])
-        await interaction.response.send_message(
-            "🗳️ 已记录你的投票（可重选覆盖）。", ephemeral=True
-        )
-        # 所有存活真人都投完了 → 立即结束投票、公布结果
+        await interaction.response.send_message("🗳️ 已记录你的投票（可重选覆盖）。", ephemeral=True)
         if self._allowed and set(self._votes.keys()) >= self._allowed:
             self._parent.stop()
 
 
 class VoteView(discord.ui.View):
-    def __init__(self, options: list[tuple[str, str]], allowed_ids: set[int],
-                 host_id: int, timeout: int):
+    def __init__(self, options, allowed_ids: set[int], host_id: int, timeout: int):
         super().__init__(timeout=timeout)
         self.votes: dict[int, int] = {}
         self.host_id = host_id
@@ -209,22 +399,21 @@ class VoteView(discord.ui.View):
     @discord.ui.button(label="结束投票并公布", style=discord.ButtonStyle.primary, emoji="⏩")
     async def finish(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.host_id:
-            await interaction.response.send_message(
-                "只有房主能提前结束投票。", ephemeral=True
-            )
+            await interaction.response.send_message("只有房主能提前结束投票。", ephemeral=True)
             return
         await interaction.response.send_message("⏩ 提前结束投票，公布结果…", ephemeral=True)
         self.stop()
 
 
+# ============================================================
+# 大厅
+# ============================================================
 class LobbyView(discord.ui.View):
-    """大厅：加入 / 退出 / 开始。"""
-
     def __init__(self, bot: discord.Client, state: GameState, thread: discord.Thread | None = None):
         super().__init__(timeout=None)
         self.bot = bot
         self.state = state
-        self.thread = thread  # 私密讨论串；为 None 时退化为在频道里玩
+        self.thread = thread
         self.message: discord.Message | None = None
 
     def embed(self) -> discord.Embed:
@@ -237,16 +426,15 @@ class LobbyView(discord.ui.View):
             description=(
                 f"{where}"
                 f"点击 **加入** 入座，房主点 **开始游戏** 即可开局。\n"
-                f"人数不足会自动用 🤖AI NPC 补位到 **{config.TOTAL_PLAYERS}** 人。\n\n"
+                f"人数不足会自动用 🤖AI NPC 补位到 **{config.TOTAL_PLAYERS}** 人。\n"
+                f"⚠️ 本局为**面板模式**：全程在面板上行动，平时频道里不能直接打字，"
+                f"轮到你时点面板按钮发言/行动。\n\n"
                 f"📋 {summarize_distribution(config.TOTAL_PLAYERS)}"
             ),
-            color=0x5865F2,
+            color=C_INFO,
         )
         humans = self.state.humans
-        if humans:
-            roster = "\n".join(f"{i+1}. {p.mention}" for i, p in enumerate(humans))
-        else:
-            roster = "（还没有人加入）"
+        roster = "\n".join(f"{i+1}. {p.mention}" for i, p in enumerate(humans)) if humans else "（还没有人加入）"
         e.add_field(name=f"已加入玩家（{len(humans)}）", value=roster, inline=False)
         e.set_footer(text="房主：点『开始游戏』开局")
         return e
@@ -268,12 +456,10 @@ class LobbyView(discord.ui.View):
             try:
                 await self.thread.add_user(interaction.user)
                 await interaction.response.send_message(
-                    f"已加入！去 {self.thread.mention} 参与游戏 🐺", ephemeral=True
-                )
+                    f"已加入！去 {self.thread.mention} 参与游戏 🐺", ephemeral=True)
             except discord.HTTPException:
                 await interaction.response.send_message(
-                    "已加入！（把你拉进讨论串失败，请确认能看到该串）", ephemeral=True
-                )
+                    "已加入！（把你拉进讨论串失败，请确认能看到该串）", ephemeral=True)
         else:
             await interaction.response.send_message("已加入！", ephemeral=True)
         await self.refresh()
@@ -304,202 +490,314 @@ class LobbyView(discord.ui.View):
             await interaction.response.send_message("游戏已经开始了。", ephemeral=True)
             return
         if not self.state.humans:
-            await interaction.response.send_message(
-                "至少要有 1 名真人玩家才能开始。", ephemeral=True
-            )
+            await interaction.response.send_message("至少要有 1 名真人玩家才能开始。", ephemeral=True)
             return
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(view=self)
-        # 在私密讨论串里开局；没有串则退化为当前频道
         target = self.thread or interaction.channel
         if self.thread is not None:
-            await interaction.followup.send(
-                f"▶️ 游戏在 {self.thread.mention} 开始了！", ephemeral=True
-            )
+            await interaction.followup.send(f"▶️ 游戏在 {self.thread.mention} 开始了！", ephemeral=True)
         asyncio.create_task(run_game(self.bot, self.state, target))
+
+
+# ============================================================
+# 狼人私密线程
+# ============================================================
+def _parent_text_channel(channel):
+    if isinstance(channel, discord.Thread):
+        return channel.parent
+    return channel
+
+
+async def ensure_wolf_thread(bot, state: GameState, channel) -> discord.Thread | None:
+    """为有真人的狼队创建/复用一个私密狼人频道，并把真人狼拉进去。"""
+    human_wolves = [w for w in state.alive_wolves() if not w.is_npc]
+    if not human_wolves:
+        return None
+    thread = None
+    if state.wolf_thread_id:
+        ch = bot.get_channel(state.wolf_thread_id)
+        if isinstance(ch, discord.Thread):
+            thread = ch
+    if thread is None:
+        parent = _parent_text_channel(channel)
+        if not isinstance(parent, discord.TextChannel):
+            return None
+        try:
+            thread = await parent.create_thread(
+                name="🐺 狼人频道",
+                type=discord.ChannelType.private_thread,
+                invitable=False,
+                auto_archive_duration=1440,
+            )
+            state.wolf_thread_id = thread.id
+            await thread.send("🐺 这里是**狼人专属频道**，只有狼能看到，可以在这里自由打字商量。")
+        except discord.HTTPException:
+            return None
+    for w in human_wolves:
+        member = bot.get_user(w.uid)
+        if member:
+            try:
+                await thread.add_user(member)
+            except discord.HTTPException:
+                pass
+    return thread
 
 
 # ============================================================
 # 游戏流程
 # ============================================================
-async def reveal_roles(state: GameState, channel) -> None:
-    """开局：贴一个『查看身份』按钮，每个人点了只有自己能看到身份（ephemeral）。"""
+async def phase_reveal(state: GameState, panel: Panel) -> None:
+    done = asyncio.Event()
     if not state.humans:
         return
-    view = RoleRevealView(state, timeout=1800)
-    await channel.send(
-        "🔍 **身份已分配**，请各位点下面按钮（只有你自己能看到）确认身份。"
-        f"\n{REVEAL_SECONDS} 秒后天黑。",
-        view=view,
+    view = RoleRevealView(state, panel, done, timeout=REVEAL_SECONDS + 60)
+    await panel.show(
+        title="🎬 游戏开始 · 确认身份",
+        desc=(f"请各位点下方按钮查看自己的身份（只有你自己可见）。\n"
+              f"全部真人确认后将自动天黑。\n\n{roster_block(state)}"),
+        color=C_INFO, view=view,
+        footer=f"已确认 0/{len(state.humans)} 名真人玩家",
     )
-    await asyncio.sleep(REVEAL_SECONDS)
+    await wait_event(done, REVEAL_SECONDS + 30)
+    view.stop()
 
 
-async def run_night(bot: discord.Client, state: GameState, channel) -> None:
-    """夜晚：预言家查验 + 狼队击杀（人类走频道内 ephemeral 菜单，NPC 走规则）。"""
-    # 需要等待行动的人类（狼 / 预言家）
-    expected = {
-        p.uid for p in state.alive_players
-        if not p.is_npc and p.role in (Role.WEREWOLF, Role.SEER)
-    }
-    actions = NightActions(expected)
-
-    # ---- NPC 先按规则行动 ----
+async def phase_seer(bot, state: GameState, panel: Panel) -> None:
+    # NPC 预言家先按规则查验
     for seer in [p for p in state.alive_players if p.role is Role.SEER and p.is_npc]:
         t = npc.seer_check_target(seer, state)
         if t is not None:
             seer.seer_results[t] = bool(state.get(t).role.is_wolf)
-    for wolf in [p for p in state.alive_wolves() if p.is_npc]:
+
+    seer = state.alive_seer()
+    desc = "🔮 **预言家请睁眼**，查验一名玩家的身份。\n其他人请闭眼等待。"
+    if seer is None:
+        await panel.show(title="🌙 第 %d 夜 · 预言家" % (state.day_count + 1),
+                         desc="🔮 预言家请行动……（夜色中似乎没有动静）", color=C_NIGHT)
+        await asyncio.sleep(2)
+        return
+    if seer.is_npc:
+        await panel.show(title="🌙 第 %d 夜 · 预言家" % (state.day_count + 1),
+                         desc=desc, color=C_NIGHT, footer="预言家正在行动…")
+        await asyncio.sleep(2.5)
+        return
+    done = asyncio.Event()
+    view = SeerGateView(state, done, timeout=TURN)
+    await panel.show(title="🌙 第 %d 夜 · 预言家" % (state.day_count + 1),
+                     desc=desc, color=C_NIGHT, view=view,
+                     footer="预言家：点『预言家查验』行动")
+    await wait_event(done, TURN)
+    view.stop()
+
+
+async def phase_wolves(bot, state: GameState, panel: Panel, channel) -> int | None:
+    """狼人夜晚，返回最终击杀目标 uid（None / 0 = 空刀）。"""
+    votes: dict[int, int] = {}
+    # NPC 狼先投
+    for wolf in [w for w in state.alive_wolves() if w.is_npc]:
         t = npc.wolf_kill_target(state)
         if t is not None:
-            actions.wolf_votes[wolf.uid] = t
+            votes[wolf.uid] = t
 
-    # ---- 人类通过频道按钮行动 ----
-    if expected:
-        view = NightPanelView(state, actions, timeout=config.TURN_SECONDS)
-        msg = await channel.send(
-            f"🌙 **天黑请闭眼……** 狼人和预言家请点下面按钮行动"
-            f"（{config.TURN_SECONDS} 秒，其他人请勿点）。",
-            view=view,
-        )
-        try:
-            await asyncio.wait_for(actions.done.wait(), timeout=config.TURN_SECONDS)
-        except asyncio.TimeoutError:
-            pass
+    human_wolves = {w.uid for w in state.alive_wolves() if not w.is_npc}
+    title = "🌙 第 %d 夜 · 狼人" % (state.day_count + 1)
+    desc = "🐺 **狼人请睁眼**，和队友商量后选择今晚要击杀的目标。\n其他人请闭眼等待。"
+
+    if human_wolves:
+        thread = await ensure_wolf_thread(bot, state, channel)
+        # NPC 狼在狼人频道里发言商量
+        if isinstance(thread, discord.Thread):
+            npc_wolves = [w for w in state.alive_wolves() if w.is_npc]
+            for nw in npc_wolves:
+                mates = [m for m in state.alive_wolves() if m.uid != nw.uid]
+                try:
+                    line = await npc.wolf_chat(nw, mates, state)
+                    await thread.send(f"🐺 **{nw.label}**：{line}")
+                except discord.HTTPException:
+                    pass
+        done = asyncio.Event()
+        view = WolfGateView(bot, state, votes, human_wolves, done, timeout=TURN)
+        await panel.show(title=title, desc=desc, color=C_NIGHT, view=view,
+                         footer="狼人：点『狼人行动』进入狼人频道并选刀")
+        await wait_event(done, TURN)
         view.stop()
-        for child in view.children:
-            child.disabled = True
-        await msg.edit(view=view)
     else:
-        await channel.send("🌙 **天黑请闭眼……**")
+        await panel.show(title=title, desc=desc, color=C_NIGHT, footer="狼人正在行动…")
+        await asyncio.sleep(2.5)
 
-    # ---- 没点的人类自动用规则兜底，保证流程推进 ----
-    for wolf in state.alive_wolves():
-        if not wolf.is_npc and wolf.uid not in actions.wolf_votes:
+    # 没投的真人狼兜底
+    for w in state.alive_wolves():
+        if w.uid not in votes:
             t = npc.wolf_kill_target(state)
             if t is not None:
-                actions.wolf_votes[wolf.uid] = t
-    for seer in [p for p in state.alive_players if p.role is Role.SEER]:
-        if not seer.is_npc and seer.uid not in actions.acted:
-            t = npc.seer_check_target(seer, state)
-            if t is not None:
-                seer.seer_results[t] = bool(state.get(t).role.is_wolf)
+                votes[w.uid] = t
 
-    kill_uid = (
-        Counter(actions.wolf_votes.values()).most_common(1)[0][0]
-        if actions.wolf_votes else None
+    if not votes:
+        return None
+    kill = Counter(votes.values()).most_common(1)[0][0]
+    return None if kill == 0 else kill
+
+
+async def phase_witch(bot, state: GameState, panel: Panel, kill_uid: int | None) -> dict:
+    """女巫夜晚，返回 {"heal": bool, "poison": uid|None}。"""
+    result = {"heal": False, "poison": None}
+    witch = state.alive_witch()
+    victim = state.get(kill_uid) if kill_uid else None
+    title = "🌙 第 %d 夜 · 女巫" % (state.day_count + 1)
+
+    if witch is None:
+        return result
+    if witch.is_npc:
+        heal, poison = npc.witch_night_action(witch, state, kill_uid)
+        if heal:
+            witch.has_heal = False
+        if poison is not None:
+            witch.has_poison = False
+        result["heal"], result["poison"] = heal, poison
+        await panel.show(title=title, desc="🧪 女巫请行动……", color=C_NIGHT, footer="女巫正在行动…")
+        await asyncio.sleep(2.5)
+        return result
+
+    done = asyncio.Event()
+    view = WitchGateView(state, victim, result, done, timeout=TURN)
+    await panel.show(
+        title=title,
+        desc="🧪 **女巫请睁眼**。点下方按钮查看今晚情况，并决定是否用药。\n其他人请闭眼等待。",
+        color=C_NIGHT, view=view, footer="女巫：点『女巫行动』",
     )
-    if kill_uid == 0:  # 0 = 狼队选择空刀
-        kill_uid = None
-    state.resolve_night(kill_uid)
+    await wait_event(done, TURN)
+    view.stop()
+    return result
 
 
-async def run_discussion(bot: discord.Client, state: GameState, channel, day_log: list[str]) -> None:
-    """白天讨论：每名存活玩家按座位号依次发言。"""
-    order = list(state.alive_players)  # players 已按座位号排序
-    order_txt = " → ".join(f"{p.seat}号" for p in order)
-    await channel.send(
-        "☀️ **天亮了，开始讨论。** 按座位号轮流发言（**没轮到你时发言会被自动删除**）：\n"
-        f"📋 {order_txt}"
-    )
-    state.discussion_active = True
-    try:
-        for player in order:
-            if player.is_npc:
-                state.current_speaker_uid = None
-                await channel.typing()
-                speech = await npc.speak(player, state, day_log)
-                await channel.send(f"**{player.label}**：{speech}")
-                day_log.append(f"{player.seat}号{player.name}: {speech}")
-                await asyncio.sleep(1.2)  # 模拟打字节奏，避免刷屏
-            else:
-                state.current_speaker_uid = player.uid  # 只有他能发言
-                await channel.send(
-                    f"🎤 现在轮到 **{player.seat}号** 玩家 {player.mention} 发言，"
-                    f"请在 **{config.TURN_SECONDS} 秒**内发言（其他人请稍候）。"
-                )
-                try:
-                    msg = await bot.wait_for(
-                        "message",
-                        timeout=config.TURN_SECONDS,
-                        check=lambda m: m.author.id == player.uid
-                        and m.channel.id == channel.id,
-                    )
-                    day_log.append(f"{player.seat}号{player.name}: {msg.content}")
-                except asyncio.TimeoutError:
-                    await channel.send(f"（{player.label} 超时，跳过发言）")
-                    day_log.append(f"{player.seat}号{player.name}: （沉默/超时）")
-                finally:
-                    state.current_speaker_uid = None
-    finally:
-        state.discussion_active = False
-        state.current_speaker_uid = None
-
-
-async def collect_last_words(bot: discord.Client, state: GameState, channel, player, seconds: int = 30) -> None:
-    """被杀 / 被放逐的玩家留遗言；NPC 由 LLM 生成一句。"""
+async def collect_last_words(state: GameState, panel: Panel, channel, player) -> None:
+    """出局玩家留遗言：NPC 由 LLM 生成；真人通过面板弹窗输入。"""
     if player.is_npc:
         text = await npc.last_word(player, state)
         await channel.send(f"🪦 **{player.label}** 的遗言：{text}")
         return
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
     state.current_speaker_uid = player.uid
-    await channel.send(
-        f"🪦 {player.mention} 出局了，请在 **{seconds} 秒**内留下遗言（直接发言；不想说可忽略）。"
+    view = SpeechGateView(player, fut, btn_label="留遗言", modal_title="你的遗言",
+                          input_label="留下你的遗言（可留空）", timeout=30)
+    await panel.show(
+        title="🪦 遗言",
+        desc=f"{player.mention} 出局了，请在 **30 秒**内点按钮留下遗言。",
+        color=C_DAY, view=view,
     )
     try:
-        msg = await bot.wait_for(
-            "message",
-            timeout=seconds,
-            check=lambda m: m.author.id == player.uid and m.channel.id == channel.id,
-        )
-        await channel.send(f"🪦 **{player.label}** 的遗言：{msg.content}")
+        text = await asyncio.wait_for(fut, timeout=30)
+        if text.strip():
+            await channel.send(f"🪦 **{player.label}** 的遗言：{text}")
+        else:
+            await channel.send(f"（{player.label} 没有留下遗言。）")
     except asyncio.TimeoutError:
         await channel.send(f"（{player.label} 没有留下遗言。）")
     finally:
         state.current_speaker_uid = None
+        view.stop()
 
 
-async def run_vote(bot: discord.Client, state: GameState, channel, day_log: list[str]):
-    """白天投票放逐。"""
+async def announce_deaths(state: GameState, panel: Panel, channel, deaths: list, day_log: list[str]) -> None:
+    if not deaths:
+        await panel.show(title="🌅 第 %d 天 · 天亮了" % state.day_count,
+                         desc="昨晚是**平安夜**，无人死亡。\n\n" + roster_block(state), color=C_DAY)
+        day_log.append(f"第{state.day_count}晚，平安夜。")
+        await asyncio.sleep(2)
+        return
+    names = "、".join(d.label for d in deaths)
+    await panel.show(title="🌅 第 %d 天 · 天亮了" % state.day_count,
+                     desc=f"昨晚倒下的是：**{names}**。\n\n" + roster_block(state), color=C_DAY)
+    for d in deaths:
+        day_log.append(f"第{state.day_count}晚，{d.name}出局。")
+    await asyncio.sleep(1.5)
+    for d in deaths:
+        await collect_last_words(state, panel, channel, d)
+
+
+async def phase_discussion(bot, state: GameState, panel: Panel, channel, day_log: list[str]) -> None:
+    order = list(state.alive_players)
+    order_txt = " → ".join(f"{p.seat}号" for p in order)
+    for player in order:
+        if not player.alive:
+            continue
+        if player.is_npc:
+            state.current_speaker_uid = None
+            await panel.show(
+                title="☀️ 第 %d 天 · 讨论" % state.day_count,
+                desc=f"轮到 **{player.label}** 发言…\n\n📋 顺序：{order_txt}",
+                color=C_DAY, footer="按座位号轮流发言",
+            )
+            await channel.typing()
+            speech = await npc.speak(player, state, day_log)
+            await channel.send(f"💬 **{player.label}**：{speech}")
+            day_log.append(f"{player.seat}号{player.name}: {speech}")
+            await asyncio.sleep(1.2)
+        else:
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future = loop.create_future()
+            state.current_speaker_uid = player.uid
+            view = SpeechGateView(player, fut, btn_label="我要发言", modal_title="你的发言",
+                                  input_label="输入你的发言", timeout=TURN)
+            await panel.show(
+                title="☀️ 第 %d 天 · 讨论" % state.day_count,
+                desc=(f"🎤 现在轮到 **{player.seat}号** {player.mention} 发言。\n"
+                      f"请在 **{TURN} 秒**内点下方按钮输入发言（其他人请稍候）。\n\n"
+                      f"📋 顺序：{order_txt}"),
+                color=C_DAY, view=view, footer="点『我要发言』弹出输入框",
+            )
+            try:
+                text = await asyncio.wait_for(fut, timeout=TURN)
+                if text.strip():
+                    await channel.send(f"💬 **{player.label}**：{text}")
+                    day_log.append(f"{player.seat}号{player.name}: {text}")
+                else:
+                    await channel.send(f"（{player.label} 选择不发言。）")
+                    day_log.append(f"{player.seat}号{player.name}: （沉默）")
+            except asyncio.TimeoutError:
+                await channel.send(f"（{player.label} 超时，跳过发言）")
+                day_log.append(f"{player.seat}号{player.name}: （沉默/超时）")
+            finally:
+                state.current_speaker_uid = None
+                view.stop()
+
+
+async def phase_vote(bot, state: GameState, panel: Panel, channel, day_log: list[str]) -> None:
     alive = list(state.alive_players)
-    # 0 = 弃权哨兵；放在最前面
     options = [("🙅 弃权（不投票）", "0")] + [(p.label, str(p.uid)) for p in alive]
     human_ids = {p.uid for p in alive if not p.is_npc}
 
     votes: dict[int, int] = {}
     if human_ids:
-        view = VoteView(options, human_ids, state.host_id, config.TURN_SECONDS)
-        msg = await channel.send(
-            f"🗳️ **投票放逐阶段**（{config.TURN_SECONDS} 秒）！存活玩家请在下方选择，"
-            f"全员投完会立即公布（房主也可点『结束投票』提前公布）：",
-            view=view,
+        view = VoteView(options, human_ids, state.host_id, TURN)
+        await panel.show(
+            title="🗳️ 第 %d 天 · 投票放逐" % state.day_count,
+            desc=(f"存活玩家请在下方选择要放逐的人（{TURN} 秒）。\n"
+                  f"全员投完会立即公布（房主也可点『结束投票』提前公布）。"),
+            color=C_DAY, view=view,
         )
         await view.wait()
         votes.update(view.votes)
-        for child in view.children:
-            child.disabled = True
-        await msg.edit(view=view)
+        view.stop()
 
-    # NPC 按规则投票
     for p in alive:
         if p.is_npc:
             t = npc.vote_target(p, state)
             if t is not None:
                 votes[p.uid] = t
 
-    # 分出弃权票（目标 0）与有效票
     real_votes = {v: t for v, t in votes.items() if t != 0}
     abstainers = [state.get(v).label for v, t in votes.items() if t == 0]
 
-    # 公示票型
     if real_votes or abstainers:
         tally = Counter(real_votes.values())
         lines = []
         for target_uid, count in tally.most_common():
-            target = state.get(target_uid)
             voters = [state.get(v).label for v, tt in real_votes.items() if tt == target_uid]
-            lines.append(f"**{target.label}**：{count} 票（{', '.join(voters)}）")
+            lines.append(f"**{state.get(target_uid).label}**：{count} 票（{', '.join(voters)}）")
         if abstainers:
             lines.append(f"🙅 弃权：{len(abstainers)} 票（{', '.join(abstainers)}）")
         await channel.send("📊 投票结果：\n" + "\n".join(lines))
@@ -513,27 +811,22 @@ async def run_vote(bot: discord.Client, state: GameState, channel, day_log: list
         day_log.append("投票平票，无人出局。")
     else:
         await channel.send(
-            f"🔨 **{exiled.label}** 被放逐出局，身份是 {exiled.role.emoji}**{exiled.role.cn}**。"
-        )
+            f"🔨 **{exiled.label}** 被放逐出局，身份是 {exiled.role.emoji}**{exiled.role.cn}**。")
         day_log.append(f"{exiled.name} 被投票放逐，身份是{exiled.role.cn}。")
-        await collect_last_words(bot, state, channel, exiled)
+        await collect_last_words(state, panel, channel, exiled)
 
 
-async def announce_end(channel, state: GameState) -> None:
-    winner = state.winner
-    if winner is Team.WOLF:
-        title = "🐺 狼人阵营获胜！"
-        color = 0xED4245
+async def announce_end(channel, panel: Panel, state: GameState) -> None:
+    if state.winner is Team.WOLF:
+        title, color = "🐺 狼人阵营获胜！", C_WIN_WOLF
     else:
-        title = "🎉 好人阵营获胜！"
-        color = 0x57F287
-    e = discord.Embed(title=title, description=state.public_roles_reveal(), color=color)
-    await channel.send(embed=e)
+        title, color = "🎉 好人阵营获胜！", C_WIN_GOOD
+    await panel.show(title=title, desc=state.public_roles_reveal(), color=color)
 
 
 async def run_game(bot: discord.Client, state: GameState, channel) -> None:
-    """整局游戏主循环。"""
-    state.play_channel_id = channel.id  # 发言管控只作用于这个频道/讨论串
+    state.play_channel_id = channel.id
+    panel = Panel(channel)
     try:
         # 1) NPC 补位
         target = max(config.TOTAL_PLAYERS, len(state.humans))
@@ -541,62 +834,51 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
         if need > 0:
             existing = {p.name for p in state.players}
             state.players.extend(npc.make_npcs(need, existing))
-
         if len(state.players) < 3:
             await channel.send("⚠️ 人数不足（至少 3 人），游戏取消。")
             return
 
-        # 2) 分配角色 + 频道内 ephemeral 查看身份
+        # 2) 分配角色
         state.assign_roles()
-        e = discord.Embed(
-            title="🎬 游戏开始！",
-            description=(
-                f"本局共 **{len(state.players)}** 人\n"
-                f"{summarize_distribution(len(state.players))}\n\n"
-                + "\n".join(f"{p.label}" for p in state.players)
-            ),
-            color=0x5865F2,
-        )
-        e.set_footer(text="点下方『查看我的身份』确认身份（只有你自己可见）")
-        await channel.send(embed=e)
-
-        await reveal_roles(state, channel)
+        await phase_reveal(state, panel)
 
         # 3) 昼夜循环
         day_log: list[str] = []
         while True:
-            await run_night(bot, state, channel)
-            victim = state.last_killed
-            if victim:
-                await channel.send(f"🌅 天亮了。昨晚 **{victim.label}** 倒下了。")
-                day_log.append(f"第{state.day_count}晚，{victim.name}被杀。")
-                await collect_last_words(bot, state, channel, victim)
-            else:
-                await channel.send("🌅 天亮了。昨晚是平安夜，无人死亡。")
-                day_log.append(f"第{state.day_count}晚，平安夜。")
+            await phase_seer(bot, state, panel)
+            kill_uid = await phase_wolves(bot, state, panel, channel)
+            witch_res = await phase_witch(bot, state, panel, kill_uid)
+            deaths = state.resolve_night(kill_uid, witch_res["heal"], witch_res["poison"])
 
+            await announce_deaths(state, panel, channel, deaths, day_log)
             if state.check_winner():
                 break
 
-            await run_discussion(bot, state, channel, day_log)
-            await run_vote(bot, state, channel, day_log)
-
+            await phase_discussion(bot, state, panel, channel, day_log)
+            await phase_vote(bot, state, panel, channel, day_log)
             if state.check_winner():
                 break
 
-        await announce_end(channel, state)
+        await announce_end(channel, panel, state)
     except Exception:
         log.exception("游戏运行出错")
         await channel.send("❌ 游戏出现内部错误，已结束本局。")
     finally:
         games.pop(state.channel_id, None)
-        # 私密讨论串：本局结束后自动归档（折叠收起），保持频道清爽
         if isinstance(channel, discord.Thread):
             try:
                 await channel.send("🗂️ 本局结束，讨论串已归档收起。")
                 await channel.edit(archived=True)
             except discord.HTTPException:
                 pass
+        # 顺手归档狼人频道
+        if state.wolf_thread_id:
+            wt = bot.get_channel(state.wolf_thread_id)
+            if isinstance(wt, discord.Thread):
+                try:
+                    await wt.edit(archived=True)
+                except discord.HTTPException:
+                    pass
 
 
 # ============================================================
@@ -605,7 +887,7 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
 class WerewolfBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.message_content = True  # 读取白天发言需要
+        intents.message_content = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
@@ -623,14 +905,12 @@ async def new_game(interaction: discord.Interaction):
     if cid in games:
         await interaction.response.send_message(
             "本频道已经有一局进行中（或正在等待开始）。用 `/werewolf cancel` 可取消。",
-            ephemeral=True,
-        )
+            ephemeral=True)
         return
     state = GameState(channel_id=cid, host_id=interaction.user.id)
     state.add_human(interaction.user.id, interaction.user.display_name)
     games[cid] = state
 
-    # 尝试创建私密讨论串：点了『加入』的人才会被拉进来；没权限则退化为在频道里玩
     thread: discord.Thread | None = None
     channel = interaction.channel
     if isinstance(channel, discord.TextChannel):
@@ -638,17 +918,15 @@ async def new_game(interaction: discord.Interaction):
             thread = await channel.create_thread(
                 name=f"🐺 狼人杀 · {interaction.user.display_name}",
                 type=discord.ChannelType.private_thread,
-                invitable=False,
-                auto_archive_duration=1440,
+                invitable=False, auto_archive_duration=1440,
             )
             await thread.add_user(interaction.user)
             await thread.send(
                 "🐺 这里是本局的**私密房间**，只有点了『加入』的人能看到。\n"
-                "房主在频道里点『开始游戏』即可开局，游戏全程在这里进行。"
-            )
+                "房主在频道里点『开始游戏』即可开局，游戏全程在这里以**面板模式**进行。")
             state.thread_id = thread.id
         except discord.HTTPException:
-            thread = None  # 没权限 / 不支持，退化为频道内进行
+            thread = None
 
     view = LobbyView(client, state, thread)
     await interaction.response.send_message(embed=view.embed(), view=view)
@@ -656,7 +934,6 @@ async def new_game(interaction: discord.Interaction):
 
 
 def _resolve_game(interaction: discord.Interaction) -> tuple[int, GameState | None]:
-    """定位本局：命令在频道或在私密讨论串里发都能找到（串用父频道 id 作 key）。"""
     ch = interaction.channel
     cid = ch.parent_id if isinstance(ch, discord.Thread) else interaction.channel_id
     return cid, games.get(cid)
@@ -673,7 +950,6 @@ async def cancel_game(interaction: discord.Interaction):
         return
     games.pop(cid, None)
     await interaction.response.send_message("🛑 本局已取消。", ephemeral=True)
-    # 顺便归档收起本局的私密讨论串
     if state.thread_id is not None:
         thread = interaction.client.get_channel(state.thread_id)
         if isinstance(thread, discord.Thread):
@@ -692,9 +968,7 @@ async def status(interaction: discord.Interaction):
         return
     await interaction.response.send_message(
         f"阶段：**{state.phase.value}**　玩家数：**{len(state.players)}**　"
-        f"存活：**{len(state.alive_players)}**",
-        ephemeral=True,
-    )
+        f"存活：**{len(state.alive_players)}**", ephemeral=True)
 
 
 @werewolf.command(name="clear", description="清理本频道最近的狼人杀消息")
@@ -702,9 +976,7 @@ async def status(interaction: discord.Interaction):
 async def clear(interaction: discord.Interaction, count: int = 100):
     if interaction.channel_id in games:
         await interaction.response.send_message(
-            "本频道还有一局进行中，请先用 `/werewolf cancel` 结束，再清理。",
-            ephemeral=True,
-        )
+            "本频道还有一局进行中，请先用 `/werewolf cancel` 结束，再清理。", ephemeral=True)
         return
     count = max(1, min(count, 200))
     await interaction.response.defer(ephemeral=True)
@@ -714,7 +986,6 @@ async def clear(interaction: discord.Interaction, count: int = 100):
     def is_mine(m: discord.Message) -> bool:
         return m.author.id == me_id
 
-    # 优先批量删除（需要『管理消息』权限）；权限不足时退化为逐条删自己的消息
     try:
         deleted = await channel.purge(limit=count, check=is_mine)
         n = len(deleted)
@@ -740,22 +1011,20 @@ async def on_ready():
 
 @client.event
 async def on_message(message: discord.Message):
-    """白天轮流发言时，删掉非当前发言人的消息，强制按顺序发言。"""
+    """面板模式：游戏频道里统一禁言——删掉所有人直接发的消息（狼人频道除外）。"""
     if message.author.bot:
         return
-    ch = message.channel
-    cid = ch.parent_id if isinstance(ch, discord.Thread) else ch.id
-    state = games.get(cid)
-    if state is None or not state.discussion_active:
+    # 找到一局正在用这个频道进行游戏的 state
+    state = next((s for s in games.values() if s.play_channel_id == message.channel.id), None)
+    if state is None:
         return
-    if message.channel.id != state.play_channel_id:
-        return
-    if message.author.id == state.current_speaker_uid:
+    # 狼人专属频道不禁言
+    if state.wolf_thread_id and message.channel.id == state.wolf_thread_id:
         return
     try:
         await message.delete()
         await message.channel.send(
-            f"⏳ {message.author.mention} 还没轮到你发言，请等点到你时再说。",
+            f"🤫 {message.author.mention} 本局是面板模式，请通过上方面板按钮行动/发言。",
             delete_after=4,
         )
     except discord.HTTPException:
@@ -766,8 +1035,7 @@ def run() -> None:
     missing = config.validate()
     if missing:
         raise SystemExit(
-            "缺少必要配置：" + ", ".join(missing) + "\n请复制 .env.example 为 .env 并填写。"
-        )
+            "缺少必要配置：" + ", ".join(missing) + "\n请复制 .env.example 为 .env 并填写。")
     client.run(config.DISCORD_TOKEN)
 
 
