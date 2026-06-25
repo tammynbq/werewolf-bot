@@ -41,7 +41,7 @@ async def chat(
     """
     try:
         resp = await _get_client().chat.completions.create(
-            model=config.OPENAI_MODEL,
+            model=config.MODEL_NAME,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},

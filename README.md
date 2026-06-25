@@ -36,7 +36,7 @@ cp .env.example .env   # 然后填写下面的配置
 | `DISCORD_TOKEN` | Discord Bot Token |
 | `OPENAI_BASE_URL` | **中转站** 地址，如 `https://your-relay.com/v1` |
 | `OPENAI_API_KEY` | 中转站分配的 key |
-| `OPENAI_MODEL` | 模型名（取决于中转站，如 `gpt-4o-mini` / `deepseek-chat`） |
+| `MODEL_NAME` | 模型名（变量名与 bq-bot 对齐，如 `claude-opus-4-8` / `gpt-4o-mini`） |
 | `WEREWOLF_TOTAL_PLAYERS` | 一局总人数，人数不足用 NPC 补位（默认 6） |
 | `WEREWOLF_TURN_SECONDS` | 单次发言/行动等待秒数（默认 60） |
 | `WEREWOLF_NPC_TEMPERATURE` | NPC 发言温度（默认 0.9） |

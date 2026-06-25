@@ -32,9 +32,10 @@ def _float(name: str, default: float) -> float:
 DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
 
 # ===== LLM 中转站（OpenAI 兼容）=====
+# 变量名与 bq-bot 对齐，方便在 Railway 等环境复用同一套配置。
 OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MODEL_NAME: str = os.getenv("MODEL_NAME", "claude-opus-4-8")
 
 # ===== 游戏参数 =====
 TOTAL_PLAYERS: int = _int("WEREWOLF_TOTAL_PLAYERS", 6)
