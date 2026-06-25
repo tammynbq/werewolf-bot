@@ -52,7 +52,7 @@ class WolfKillSelect(discord.ui.Select):
     """狼人在 ephemeral 菜单里选择击杀目标。"""
 
     def __init__(self, wolf, state: GameState, actions: NightActions):
-        options = [
+        options = [discord.SelectOption(label="🌙 空刀（今晚不杀人）", value="0")] + [
             discord.SelectOption(label=p.label, value=str(p.uid))
             for p in state.alive_players if not (p.role and p.role.is_wolf)
         ]
@@ -62,12 +62,15 @@ class WolfKillSelect(discord.ui.Select):
         self._actions = actions
 
     async def callback(self, interaction: discord.Interaction):
-        target = self._state.get(int(self.values[0]))
-        self._actions.wolf_votes[self._wolf.uid] = target.uid
+        val = int(self.values[0])
+        self._actions.wolf_votes[self._wolf.uid] = val  # 0 = 空刀
         self._actions.mark(self._wolf.uid)
-        await interaction.response.edit_message(
-            content=f"🐺 你选择击杀 **{target.label}**。（可重新点按钮修改）", view=None
-        )
+        if val == 0:
+            content = "🐺 你选择**今晚空刀**（不杀人）。（可重新点按钮修改）"
+        else:
+            target = self._state.get(val)
+            content = f"🐺 你选择击杀 **{target.label}**。（可重新点按钮修改）"
+        await interaction.response.edit_message(content=content, view=None)
 
 
 class SeerCheckSelect(discord.ui.Select):
@@ -345,6 +348,8 @@ async def run_night(bot: discord.Client, state: GameState, channel) -> None:
         Counter(actions.wolf_votes.values()).most_common(1)[0][0]
         if actions.wolf_votes else None
     )
+    if kill_uid == 0:  # 0 = 狼队选择空刀
+        kill_uid = None
     state.resolve_night(kill_uid)
 
 
@@ -384,7 +389,8 @@ async def run_discussion(bot: discord.Client, state: GameState, channel, day_log
 async def run_vote(bot: discord.Client, state: GameState, channel, day_log: list[str]):
     """白天投票放逐。"""
     alive = list(state.alive_players)
-    options = [(p.label, str(p.uid)) for p in alive]
+    # 0 = 弃权哨兵；放在最前面
+    options = [("🙅 弃权（不投票）", "0")] + [(p.label, str(p.uid)) for p in alive]
     human_ids = {p.uid for p in alive if not p.is_npc}
 
     votes: dict[int, int] = {}
@@ -407,18 +413,27 @@ async def run_vote(bot: discord.Client, state: GameState, channel, day_log: list
             if t is not None:
                 votes[p.uid] = t
 
+    # 分出弃权票（目标 0）与有效票
+    real_votes = {v: t for v, t in votes.items() if t != 0}
+    abstainers = [state.get(v).label for v, t in votes.items() if t == 0]
+
     # 公示票型
-    if votes:
-        tally = Counter(votes.values())
+    if real_votes or abstainers:
+        tally = Counter(real_votes.values())
         lines = []
         for target_uid, count in tally.most_common():
             target = state.get(target_uid)
-            voters = [state.get(v).label for v, tt in votes.items() if tt == target_uid]
+            voters = [state.get(v).label for v, tt in real_votes.items() if tt == target_uid]
             lines.append(f"**{target.label}**：{count} 票（{', '.join(voters)}）")
+        if abstainers:
+            lines.append(f"🙅 弃权：{len(abstainers)} 票（{', '.join(abstainers)}）")
         await channel.send("📊 投票结果：\n" + "\n".join(lines))
 
-    exiled, tie = state.resolve_votes(votes)
-    if tie or exiled is None:
+    exiled, tie = state.resolve_votes(real_votes)
+    if not real_votes:
+        await channel.send("🤐 全员弃权，本轮无人被放逐。")
+        day_log.append("本轮全员弃权，无人出局。")
+    elif tie or exiled is None:
         await channel.send("⚖️ 平票，本轮无人被放逐。")
         day_log.append("投票平票，无人出局。")
     else:
