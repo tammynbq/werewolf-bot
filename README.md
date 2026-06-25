@@ -57,6 +57,20 @@ cp .env.example .env   # 然后填写下面的配置
 python bot.py
 ```
 
+## 部署到 Railway
+
+本仓库已带 `Procfile`（`worker: python bot.py`）和 `.python-version`，Railway 会自动识别为
+后台 worker（无需暴露端口）。
+
+1. Railway → New Project → Deploy from GitHub repo，选 `tammynbq/werewolf-bot`。
+2. Settings → 选择要部署的分支（如 `claude/discord-werewolf-ai-bot-nkjwmt` 或合并后的 `main`）。
+3. Variables 里填环境变量（变量名与 bq-bot 一致，可直接复用）：
+   `DISCORD_TOKEN`、`OPENAI_API_KEY`、`OPENAI_BASE_URL`、`MODEL_NAME`，
+   按需再加 `WEREWOLF_TOTAL_PLAYERS` 等。
+4. 部署后看 Deploy Logs，出现 `已登录为 ...` 即代表 bot 上线。
+
+> bot 是常驻 worker，不监听 HTTP 端口；Railway 不需要配 healthcheck / 端口。
+
 ## 玩法
 
 1. 在频道里输入 `/werewolf new` 开一局，会弹出大厅。
