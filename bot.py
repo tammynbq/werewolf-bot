@@ -402,16 +402,32 @@ class VoteSelect(discord.ui.Select):
         self._votes = votes
         self._parent = parent
 
+    @staticmethod
+    async def _safe_reply(interaction: discord.Interaction, text: str) -> None:
+        """回应点击；令牌过期/已回应等情况静默吞掉，避免触发 on_error 弹『出了点问题』。
+
+        投票本身已在调用前记录，所以即便这句确认发不出去，票依然有效。
+        """
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id not in self._allowed:
-            await interaction.response.send_message("你不是存活玩家，不能投票。", ephemeral=True)
+            await self._safe_reply(interaction, "你不是存活玩家，不能投票。")
             return
         try:
-            self._votes[interaction.user.id] = int(self.values[0])
+            choice = int(self.values[0])
         except (ValueError, IndexError):
-            await interaction.response.send_message("没读到你的选择，请再选一次。", ephemeral=True)
+            await self._safe_reply(interaction, "没读到你的选择，请再选一次。")
             return
-        await interaction.response.send_message("🗳️ 已记录你的投票（可重选覆盖）。", ephemeral=True)
+        # 先记票，再回应：即便回应因令牌过期失败，这一票也已经算上。
+        self._votes[interaction.user.id] = choice
+        await self._safe_reply(interaction, "🗳️ 已记录你的投票（可重选覆盖）。")
         if self._allowed and set(self._votes.keys()) >= self._allowed:
             self._parent.stop()
 
