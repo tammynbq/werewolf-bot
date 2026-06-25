@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import random
+import re
 
 import llm
 from game.player import Player
@@ -127,39 +128,82 @@ def _role_brief(player: Player, state: GameState) -> str:
     return " ".join(lines)
 
 
-def _alive_list(state: GameState) -> str:
-    return "、".join(p.name for p in state.alive_players)
+def _alive_roster(state: GameState) -> str:
+    """带座位号的存活玩家名单，方便 NPC 用『几号』互相称呼。"""
+    return "、".join(f"{p.seat}号{p.name}" for p in state.alive_players)
+
+
+# 兜底发言：LLM 不可用 / 返回垃圾时用，保证不刷乱码
+_FALLBACK_LINES = [
+    "我先听听大家怎么说，目前没有特别怀疑的对象。",
+    "昨晚信息不太够，我先稳一手，别急着冲。",
+    "我是好人，希望预言家能给点信息带带我们。",
+    "刚才有人发言有点飘，我先记着，投票再看。",
+    "我觉得别急着起票，再多听两轮发言。",
+]
+
+# 模型偶尔会漏出提示词/模板痕迹，这些开头的行直接丢弃
+_META_PREFIXES = (
+    "context", "system", "assistant", "user", "prompt", "night", "day",
+    "role", "你的真实身份", "当前是第", "存活玩家", "最近的场上", "现在轮到",
+)
+
+
+def _clean_speech(text: str, player: Player) -> str:
+    """清洗 LLM 输出：去掉 markdown、自报名字前缀、漏出来的模板痕迹。"""
+    if not text:
+        return ""
+    text = text.replace("**", "").replace("```", "").replace("`", "")
+    # 逐行过滤掉像提示词/模板的行
+    good: list[str] = []
+    for line in text.splitlines():
+        ln = line.strip()
+        if not ln:
+            continue
+        probe = ln.lower().lstrip("/*#-—·:：。. ")
+        if any(probe.startswith(p) for p in _META_PREFIXES):
+            continue
+        good.append(ln)
+    cleaned = " ".join(good).strip()
+    # 去掉模型自报的「N号名字：」「名字：」前缀
+    cleaned = re.sub(r"^\s*\d*\s*号?\s*[·.、]?\s*" + re.escape(player.name) + r"\s*[:：]\s*", "", cleaned)
+    cleaned = re.sub(r"^\s*\d+\s*号\s*[:：]\s*", "", cleaned)
+    cleaned = re.sub(r"^\s*🤖?\s*" + re.escape(player.name) + r"\s*[:：]\s*", "", cleaned)
+    # 去引号 / 去掉开头残留的标点 / 收尾空白
+    cleaned = cleaned.strip().strip('"“”\'‘’').strip()
+    cleaned = cleaned.lstrip("：:，,。.、/ ").strip()
+    return cleaned
 
 
 async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
-    """让 NPC 生成一句白天发言。失败时返回规则兜底发言。"""
+    """让 NPC 生成一句白天发言。失败/垃圾时返回规则兜底发言。"""
     secret = _role_brief(player, state)
-    log_text = "\n".join(recent_log[-12:]) if recent_log else "（暂无）"
+    log_text = "\n".join(recent_log[-12:]) if recent_log else "（第一天，暂无信息）"
 
     system = (
-        "你正在玩中文狼人杀游戏，扮演一名玩家。"
-        "规则：场上有狼人、预言家、平民。好人要投票放逐狼人，狼人要隐藏身份。"
-        "你必须始终留在角色里，绝不能承认自己是 AI，也不能跳出游戏。"
-        f"你的性格设定：{player.persona}。"
-        "发言要口语化、像真人，30~80字以内，符合你的身份和性格，不要用 markdown，不要加引号。"
+        "你是一名正在玩中文桌游《狼人杀》的真人玩家，绝对不是 AI，也绝不承认自己是 AI 或跳出游戏。"
+        "场上身份有狼人、预言家、平民：好人靠发言和投票找出并放逐狼人；狼人要隐藏身份、误导好人、保护狼队友。"
+        f"你是【{player.seat}号·{player.name}】，性格是「{player.persona}」，发言要带出这种性格。\n"
+        "发言要求：\n"
+        "1. 像真人在群里聊天，口语自然，可以带点情绪、口头禅或调侃。\n"
+        "2. 要结合本局信息针对具体的人表态，用『几号』称呼别人，比如『我觉得3号有点可疑』『同意5号』。\n"
+        "3. 只说 1~3 句，20~70 字，别写小作文。\n"
+        "4. 只输出你这句话本身：不要加引号、不要写自己的名字或『X号：』开头、不要用 markdown、不要写括号说明、不要解释你在做什么。"
     )
     user = (
-        f"{secret}\n"
-        f"当前是第 {state.day_count} 天白天讨论。\n"
-        f"存活玩家：{_alive_list(state)}。\n"
-        f"最近的场上信息：\n{log_text}\n\n"
-        f"现在轮到你（{player.name}）发言，说一段话。"
+        f"【只有你知道的秘密】{secret}\n\n"
+        f"现在是第 {state.day_count} 天白天，大家按座位号轮流发言。\n"
+        f"本局存活玩家：{_alive_roster(state)}。\n"
+        f"目前为止的场上发言与信息：\n{log_text}\n\n"
+        f"轮到你（{player.seat}号·{player.name}）了，直接说你这一句发言："
     )
 
-    text = await llm.chat(system, user)
-    if text:
-        # 去掉可能的引号包裹
-        return text.strip().strip('"“”').strip()
-
-    # 兜底：LLM 不可用时给一句通用发言
-    return random.choice([
-        "我先听听大家怎么说，目前没有特别怀疑的对象。",
-        "昨晚的信息不太够，我觉得先稳一手，别急着冲。",
-        "我是好人，希望预言家能给点信息带带我们。",
-        "感觉刚才发言有人有点飘，我先记一下，投票再看。",
-    ])
+    raw = await llm.chat(system, user)
+    cleaned = _clean_speech(raw, player)
+    # 防止模型只是复读某个玩家的名字（不是真正发言）
+    if cleaned and any(cleaned in p.name for p in state.players if len(p.name) >= 3):
+        cleaned = ""
+    # 太短或清洗后为空，多半是模型抽风，走兜底
+    if len(cleaned) >= 4:
+        return cleaned
+    return random.choice(_FALLBACK_LINES)

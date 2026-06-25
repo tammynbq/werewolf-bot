@@ -71,6 +71,9 @@ class GameState:
         random.shuffle(roles)
         for player, role in zip(self.players, roles):
             player.role = role
+        # 按入座顺序分配座位号（1-based），用于轮流发言与互相称呼
+        for i, player in enumerate(self.players, start=1):
+            player.seat = i
         self.phase = Phase.NIGHT
         self.day_count = 0
 

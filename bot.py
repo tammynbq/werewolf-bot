@@ -349,18 +349,24 @@ async def run_night(bot: discord.Client, state: GameState, channel) -> None:
 
 
 async def run_discussion(bot: discord.Client, state: GameState, channel, day_log: list[str]) -> None:
-    """白天讨论：每名存活玩家依次发言。"""
-    await channel.send("☀️ **天亮了，开始讨论。** 轮流发言，说说你的看法。")
-    for player in list(state.alive_players):
+    """白天讨论：每名存活玩家按座位号依次发言。"""
+    order = list(state.alive_players)  # players 已按座位号排序
+    order_txt = " → ".join(f"{p.seat}号" for p in order)
+    await channel.send(
+        "☀️ **天亮了，开始讨论。** 按座位号轮流发言：\n"
+        f"📋 {order_txt}"
+    )
+    for player in order:
         if player.is_npc:
             await channel.typing()
             speech = await npc.speak(player, state, day_log)
             await channel.send(f"**{player.label}**：{speech}")
-            day_log.append(f"{player.name}: {speech}")
+            day_log.append(f"{player.seat}号{player.name}: {speech}")
             await asyncio.sleep(1.2)  # 模拟打字节奏，避免刷屏
         else:
             await channel.send(
-                f"🎤 轮到 {player.mention} 发言，请在 **{config.TURN_SECONDS} 秒**内于本频道发言。"
+                f"🎤 现在轮到 **{player.seat}号** 玩家 {player.mention} 发言，"
+                f"请在 **{config.TURN_SECONDS} 秒**内于本频道发言。"
             )
             try:
                 msg = await bot.wait_for(
@@ -369,10 +375,10 @@ async def run_discussion(bot: discord.Client, state: GameState, channel, day_log
                     check=lambda m: m.author.id == player.uid
                     and m.channel.id == channel.id,
                 )
-                day_log.append(f"{player.name}: {msg.content}")
+                day_log.append(f"{player.seat}号{player.name}: {msg.content}")
             except asyncio.TimeoutError:
                 await channel.send(f"（{player.label} 超时，跳过发言）")
-                day_log.append(f"{player.name}: （沉默/超时）")
+                day_log.append(f"{player.seat}号{player.name}: （沉默/超时）")
 
 
 async def run_vote(bot: discord.Client, state: GameState, channel, day_log: list[str]):

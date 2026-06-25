@@ -14,6 +14,7 @@ class Player:
     is_npc: bool = False
     role: Role | None = None
     alive: bool = True
+    seat: int = 0   # 座位号（1-based），开局分配，用于轮流发言与互相称呼
 
     # 仅 NPC 用：性格设定，喂给 LLM 让发言有差异
     persona: str = ""
@@ -32,4 +33,5 @@ class Player:
     def label(self) -> str:
         """纯文本展示名（不触发提及），用于列表 / 投票面板。"""
         prefix = "🤖" if self.is_npc else "🧑"
-        return f"{prefix}{self.name}"
+        seat = f"{self.seat}号·" if self.seat else ""
+        return f"{seat}{prefix}{self.name}"
