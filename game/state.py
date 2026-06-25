@@ -80,12 +80,15 @@ class GameState:
 
     # ---------- 开局 ----------
     def assign_roles(self) -> None:
-        """打乱并分配角色。"""
+        """打乱并分配角色与座位号。"""
+        # 先打乱玩家列表，使座位号、发言顺序都与「加入顺序」无关，
+        # 避免有人对照大厅入座名单反推出某号是谁（保证匿名不被解码）。
+        random.shuffle(self.players)
         roles = role_distribution(len(self.players))
         random.shuffle(roles)
         for player, role in zip(self.players, roles):
             player.role = role
-        # 按入座顺序分配座位号（1-based），用于轮流发言与互相称呼
+        # 在打乱后的顺序上分配 1-based 座位号
         for i, player in enumerate(self.players, start=1):
             player.seat = i
         self.phase = Phase.NIGHT
@@ -159,11 +162,12 @@ class GameState:
         return self.winner
 
     def public_roles_reveal(self) -> str:
-        """游戏结束时公开所有人的身份。"""
+        """游戏结束时公开所有人的身份，并揭晓每个座位号背后的真实玩家。"""
         lines = []
-        for p in self.players:
+        for p in sorted(self.players, key=lambda x: x.seat):
             status = "存活" if p.alive else "出局"
             role = p.role.cn if p.role else "?"
             emoji = p.role.emoji if p.role else "❓"
-            lines.append(f"{emoji} {p.label} —— {role}（{status}）")
+            # 结算时解除匿名：座位号 → 真实玩家（NPC 显示机器人名）
+            lines.append(f"{emoji} {p.label}（{p.mention}）—— {role}（{status}）")
         return "\n".join(lines)
