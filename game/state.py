@@ -30,6 +30,8 @@ class GameState:
         self.players: list[Player] = []
         self.day_count = 0
         self.winner: Team | None = None
+        # 本局私密讨论串的 id（无则在频道内进行）
+        self.thread_id: int | None = None
         # 每晚的临时记录
         self.last_killed: Player | None = None
 

@@ -204,16 +204,22 @@ class VoteView(discord.ui.View):
 class LobbyView(discord.ui.View):
     """大厅：加入 / 退出 / 开始。"""
 
-    def __init__(self, bot: discord.Client, state: GameState):
+    def __init__(self, bot: discord.Client, state: GameState, thread: discord.Thread | None = None):
         super().__init__(timeout=None)
         self.bot = bot
         self.state = state
+        self.thread = thread  # 私密讨论串；为 None 时退化为在频道里玩
         self.message: discord.Message | None = None
 
     def embed(self) -> discord.Embed:
+        if self.thread is not None:
+            where = f"🔒 本局在私密讨论串进行：{self.thread.mention}\n点 **加入** 后才能看到串里的内容。\n\n"
+        else:
+            where = ""
         e = discord.Embed(
             title="🐺 狼人杀大厅",
             description=(
+                f"{where}"
                 f"点击 **加入** 入座，房主点 **开始游戏** 即可开局。\n"
                 f"人数不足会自动用 🤖AI NPC 补位到 **{config.TOTAL_PLAYERS}** 人。\n\n"
                 f"📋 {summarize_distribution(config.TOTAL_PLAYERS)}"
@@ -242,7 +248,18 @@ class LobbyView(discord.ui.View):
         if not ok:
             await interaction.response.send_message("你已经在房间里了。", ephemeral=True)
             return
-        await interaction.response.send_message("已加入！", ephemeral=True)
+        if self.thread is not None:
+            try:
+                await self.thread.add_user(interaction.user)
+                await interaction.response.send_message(
+                    f"已加入！去 {self.thread.mention} 参与游戏 🐺", ephemeral=True
+                )
+            except discord.HTTPException:
+                await interaction.response.send_message(
+                    "已加入！（把你拉进讨论串失败，请确认能看到该串）", ephemeral=True
+                )
+        else:
+            await interaction.response.send_message("已加入！", ephemeral=True)
         await self.refresh()
 
     @discord.ui.button(label="退出", style=discord.ButtonStyle.secondary, emoji="🚪")
@@ -254,6 +271,11 @@ class LobbyView(discord.ui.View):
         if not ok:
             await interaction.response.send_message("你不在房间里。", ephemeral=True)
             return
+        if self.thread is not None:
+            try:
+                await self.thread.remove_user(interaction.user)
+            except discord.HTTPException:
+                pass
         await interaction.response.send_message("已退出。", ephemeral=True)
         await self.refresh()
 
@@ -273,9 +295,13 @@ class LobbyView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(view=self)
-        # 启动游戏主流程
-        channel = interaction.channel
-        asyncio.create_task(run_game(self.bot, self.state, channel))
+        # 在私密讨论串里开局；没有串则退化为当前频道
+        target = self.thread or interaction.channel
+        if self.thread is not None:
+            await interaction.followup.send(
+                f"▶️ 游戏在 {self.thread.mention} 开始了！", ephemeral=True
+            )
+        asyncio.create_task(run_game(self.bot, self.state, target))
 
 
 # ============================================================
@@ -512,6 +538,13 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
         await channel.send("❌ 游戏出现内部错误，已结束本局。")
     finally:
         games.pop(state.channel_id, None)
+        # 私密讨论串：本局结束后自动归档（折叠收起），保持频道清爽
+        if isinstance(channel, discord.Thread):
+            try:
+                await channel.send("🗂️ 本局结束，讨论串已归档收起。")
+                await channel.edit(archived=True)
+            except discord.HTTPException:
+                pass
 
 
 # ============================================================
@@ -544,15 +577,42 @@ async def new_game(interaction: discord.Interaction):
     state = GameState(channel_id=cid, host_id=interaction.user.id)
     state.add_human(interaction.user.id, interaction.user.display_name)
     games[cid] = state
-    view = LobbyView(client, state)
+
+    # 尝试创建私密讨论串：点了『加入』的人才会被拉进来；没权限则退化为在频道里玩
+    thread: discord.Thread | None = None
+    channel = interaction.channel
+    if isinstance(channel, discord.TextChannel):
+        try:
+            thread = await channel.create_thread(
+                name=f"🐺 狼人杀 · {interaction.user.display_name}",
+                type=discord.ChannelType.private_thread,
+                invitable=False,
+                auto_archive_duration=1440,
+            )
+            await thread.add_user(interaction.user)
+            await thread.send(
+                "🐺 这里是本局的**私密房间**，只有点了『加入』的人能看到。\n"
+                "房主在频道里点『开始游戏』即可开局，游戏全程在这里进行。"
+            )
+            state.thread_id = thread.id
+        except discord.HTTPException:
+            thread = None  # 没权限 / 不支持，退化为频道内进行
+
+    view = LobbyView(client, state, thread)
     await interaction.response.send_message(embed=view.embed(), view=view)
     view.message = await interaction.original_response()
 
 
+def _resolve_game(interaction: discord.Interaction) -> tuple[int, GameState | None]:
+    """定位本局：命令在频道或在私密讨论串里发都能找到（串用父频道 id 作 key）。"""
+    ch = interaction.channel
+    cid = ch.parent_id if isinstance(ch, discord.Thread) else interaction.channel_id
+    return cid, games.get(cid)
+
+
 @werewolf.command(name="cancel", description="取消本频道当前这一局（仅房主）")
 async def cancel_game(interaction: discord.Interaction):
-    cid = interaction.channel_id
-    state = games.get(cid)
+    cid, state = _resolve_game(interaction)
     if state is None:
         await interaction.response.send_message("本频道没有进行中的游戏。", ephemeral=True)
         return
@@ -560,12 +620,21 @@ async def cancel_game(interaction: discord.Interaction):
         await interaction.response.send_message("只有房主能取消游戏。", ephemeral=True)
         return
     games.pop(cid, None)
-    await interaction.response.send_message("🛑 本局已取消。")
+    await interaction.response.send_message("🛑 本局已取消。", ephemeral=True)
+    # 顺便归档收起本局的私密讨论串
+    if state.thread_id is not None:
+        thread = interaction.client.get_channel(state.thread_id)
+        if isinstance(thread, discord.Thread):
+            try:
+                await thread.send("🛑 本局已被房主取消，讨论串归档收起。")
+                await thread.edit(archived=True)
+            except discord.HTTPException:
+                pass
 
 
 @werewolf.command(name="status", description="查看本频道游戏状态")
 async def status(interaction: discord.Interaction):
-    state = games.get(interaction.channel_id)
+    _cid, state = _resolve_game(interaction)
     if state is None:
         await interaction.response.send_message("本频道没有进行中的游戏。", ephemeral=True)
         return
