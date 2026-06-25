@@ -576,6 +576,39 @@ async def status(interaction: discord.Interaction):
     )
 
 
+@werewolf.command(name="clear", description="清理本频道最近的狼人杀消息")
+@app_commands.describe(count="要扫描清理的最近消息条数（默认 100，最多 200）")
+async def clear(interaction: discord.Interaction, count: int = 100):
+    if interaction.channel_id in games:
+        await interaction.response.send_message(
+            "本频道还有一局进行中，请先用 `/werewolf cancel` 结束，再清理。",
+            ephemeral=True,
+        )
+        return
+    count = max(1, min(count, 200))
+    await interaction.response.defer(ephemeral=True)
+    channel = interaction.channel
+    me_id = interaction.client.user.id
+
+    def is_mine(m: discord.Message) -> bool:
+        return m.author.id == me_id
+
+    # 优先批量删除（需要『管理消息』权限）；权限不足时退化为逐条删自己的消息
+    try:
+        deleted = await channel.purge(limit=count, check=is_mine)
+        n = len(deleted)
+    except discord.Forbidden:
+        n = 0
+        async for m in channel.history(limit=count):
+            if is_mine(m):
+                try:
+                    await m.delete()
+                    n += 1
+                except discord.HTTPException:
+                    pass
+    await interaction.followup.send(f"🧹 已清理 {n} 条狼人杀消息。", ephemeral=True)
+
+
 client.tree.add_command(werewolf)
 
 
