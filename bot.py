@@ -392,73 +392,82 @@ class SpeechGateView(discord.ui.View):
 # ============================================================
 # 投票面板
 # ============================================================
-class VoteSelect(discord.ui.Select):
-    def __init__(self, options, allowed_ids: set[int], votes: dict[int, int], parent):
+class VoteChoiceSelect(discord.ui.Select):
+    """投票下拉选单——只放在『私有(ephemeral)消息』里，和夜晚预言家/狼的选单同款套路。
+
+    历史 bug：之前把下拉选单直接挂在公开频道消息上，玩家一选就『交互失败/出了点问题』。
+    Discord 里公开消息上的下拉选单交互不稳定，改成『公开按钮 → 弹私有选单(edit_message)』
+    这条已被夜晚阶段验证可用的链路即可。
+    """
+
+    def __init__(self, voter_id: int, options, label_map: dict[int, str],
+                 votes: dict[int, int], allowed_ids: set[int], done: asyncio.Event):
         super().__init__(
-            placeholder="选择要放逐的玩家…", min_values=1, max_values=1,
+            placeholder="选择要放逐的人…", min_values=1, max_values=1,
             options=[discord.SelectOption(label=l, value=v) for l, v in options],
         )
-        self._allowed = allowed_ids
+        self._voter = voter_id
+        self._label_map = label_map
         self._votes = votes
-        self._parent = parent
-
-    @staticmethod
-    async def _safe_reply(interaction: discord.Interaction, text: str) -> None:
-        """回应点击；令牌过期/已回应等情况静默吞掉，避免触发 on_error 弹『出了点问题』。
-
-        投票本身已在调用前记录，所以即便这句确认发不出去，票依然有效。
-        """
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(text, ephemeral=True)
-            else:
-                await interaction.response.send_message(text, ephemeral=True)
-        except discord.HTTPException:
-            pass
+        self._allowed = allowed_ids
+        self._done = done
 
     async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id not in self._allowed:
-            await self._safe_reply(interaction, "你不是存活玩家，不能投票。")
-            return
         try:
             choice = int(self.values[0])
         except (ValueError, IndexError):
-            await self._safe_reply(interaction, "没读到你的选择，请再选一次。")
+            await interaction.response.edit_message(
+                content="没读到你的选择，请重新点面板上的『投票』按钮再选一次。", view=None)
             return
-        # 先记票，再回应：即便回应因令牌过期失败，这一票也已经算上。
-        self._votes[interaction.user.id] = choice
-        await self._safe_reply(interaction, "🗳️ 已记录你的投票（可重选覆盖）。")
+        self._votes[self._voter] = choice
+        picked = "🙅 弃权（不投票）" if choice == 0 else self._label_map.get(choice, "该玩家")
+        await interaction.response.edit_message(
+            content=f"🗳️ 已记录：你投了 **{picked}**。（想改票就再点面板上的『投票』按钮）",
+            view=None,
+        )
+        # 所有存活真人都投完了 → 立即结束投票
         if self._allowed and set(self._votes.keys()) >= self._allowed:
-            self._parent.stop()
+            self._done.set()
 
 
-class VoteView(discord.ui.View):
-    def __init__(self, options, allowed_ids: set[int], host_id: int, timeout: int):
+class VoteGateView(discord.ui.View):
+    """公开面板上的投票入口：每个人点『投票』各自弹出私有选单；房主可提前结束。"""
+
+    def __init__(self, options, label_map: dict[int, str], allowed_ids: set[int],
+                 host_id: int, votes: dict[int, int], done: asyncio.Event, timeout: int):
         super().__init__(timeout=timeout)
-        self.votes: dict[int, int] = {}
-        self.host_id = host_id
-        self.add_item(VoteSelect(options, allowed_ids, self.votes, self))
+        self._options = options
+        self._label_map = label_map
+        self._allowed = allowed_ids
+        self._host_id = host_id
+        self._votes = votes
+        self._done = done
+
+    @discord.ui.button(label="投票", style=discord.ButtonStyle.success, emoji="🗳️")
+    async def vote(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id not in self._allowed:
+            await interaction.response.send_message("你不是存活玩家，不能投票。", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=self.timeout)
+        view.add_item(VoteChoiceSelect(
+            interaction.user.id, self._options, self._label_map,
+            self._votes, self._allowed, self._done))
+        already = self._votes.get(interaction.user.id)
+        tip = ""
+        if already is not None:
+            picked = "🙅 弃权" if already == 0 else self._label_map.get(already, "该玩家")
+            tip = f"（你当前投的是 **{picked}**，重选即可改票）\n"
+        await interaction.response.send_message(
+            f"{tip}请选择要放逐的人：", view=view, ephemeral=True)
 
     @discord.ui.button(label="结束投票并公布", style=discord.ButtonStyle.primary, emoji="⏩")
     async def finish(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.host_id:
+        if interaction.user.id != self._host_id:
             await interaction.response.send_message("只有房主能提前结束投票。", ephemeral=True)
             return
         await interaction.response.send_message("⏩ 提前结束投票，公布结果…", ephemeral=True)
+        self._done.set()
         self.stop()
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception,
-                       item: discord.ui.Item) -> None:
-        # 默认实现只打日志、不回应交互，会让玩家看到「交互失败」。这里显式反馈，
-        # 并把真实异常记到日志，方便定位（避免静默吞错）。
-        log.exception("投票交互出错：item=%s", item, exc_info=error)
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send("投票时出了点问题，请再点一次。", ephemeral=True)
-            else:
-                await interaction.response.send_message("投票时出了点问题，请再点一次。", ephemeral=True)
-        except discord.HTTPException:
-            pass
 
 
 # ============================================================
@@ -830,10 +839,13 @@ async def phase_vote(bot, state: GameState, panel: Panel, channel, day_log: list
     options = [("🙅 弃权（不投票）", "0")] + [(p.label, str(p.uid)) for p in alive]
     human_ids = {p.uid for p in alive if not p.is_npc}
 
+    # value(uid) -> 展示名，给确认提示用
+    label_map = {p.uid: p.label for p in alive}
+
     votes: dict[int, int] = {}
     if human_ids:
-        view = VoteView(options, human_ids, state.host_id, VOTE)
-        # 投票面板单独发一条新消息承载（不复用常驻面板），组件干净、不易超时失效。
+        done = asyncio.Event()
+        view = VoteGateView(options, label_map, human_ids, state.host_id, votes, done, VOTE)
         await panel.show(
             title="🗳️ 第 %d 天 · 投票放逐" % state.day_count,
             desc="存活玩家请在下方的投票面板里选择要放逐的人。",
@@ -841,13 +853,12 @@ async def phase_vote(bot, state: GameState, panel: Panel, channel, day_log: list
         )
         vote_embed = discord.Embed(
             title="🗳️ 投票放逐",
-            description=(f"存活玩家请选择要放逐的人（{VOTE} 秒内）。\n"
+            description=(f"存活玩家点下方 **🗳️ 投票** 按钮选择要放逐的人（{VOTE} 秒内）。\n"
                         f"全员投完会立即公布（房主也可点『结束投票』提前公布）。"),
             color=C_DAY,
         )
         vote_msg = await channel.send(embed=vote_embed, view=view)
-        await view.wait()
-        votes.update(view.votes)
+        await wait_event(done, VOTE)
         view.stop()
         try:
             await vote_msg.edit(view=None)  # 投票结束后清掉按钮，避免残留可点
