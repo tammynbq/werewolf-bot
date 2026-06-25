@@ -40,6 +40,7 @@ MODEL_NAME: str = os.getenv("MODEL_NAME", "claude-opus-4-8")
 # ===== 游戏参数 =====
 TOTAL_PLAYERS: int = _int("WEREWOLF_TOTAL_PLAYERS", 6)
 TURN_SECONDS: int = _int("WEREWOLF_TURN_SECONDS", 60)
+REVEAL_SECONDS: int = _int("WEREWOLF_REVEAL_SECONDS", 20)
 NPC_TEMPERATURE: float = _float("WEREWOLF_NPC_TEMPERATURE", 0.9)
 
 
