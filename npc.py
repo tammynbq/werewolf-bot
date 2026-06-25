@@ -79,9 +79,10 @@ def witch_night_action(
 ) -> tuple[bool, int | None]:
     """NPC 女巫夜晚决策，返回 (是否用解药救, 毒药目标 uid 或 None)。
 
-    规则（保守、像个谨慎的好人）：
+    规则（像个谨慎的好人，几乎不乱毒）：
     - 有解药且今晚有人被刀、且被刀的不是自己 → 50% 概率救。
-    - 没救人时，有毒药 → 20% 概率毒一名随机存活玩家（不毒自己）。
+    - 毒药：没有可靠信息时一律留着不乱毒（凭空毒人很可能毒到好人）。
+      只有残局（存活 ≤ 4 人，毒一个就可能左右胜负）才小概率出毒。
     - 同一晚不会既救又毒。
     """
     heal = False
@@ -89,10 +90,12 @@ def witch_night_action(
         heal = random.random() < 0.5
 
     poison_uid = None
-    if not heal and witch.has_poison and random.random() < 0.2:
-        others = [p for p in state.alive_players if p.uid != witch.uid]
-        if others:
-            poison_uid = random.choice(others).uid
+    if not heal and witch.has_poison:
+        alive = state.alive_players
+        if len(alive) <= 4 and random.random() < 0.15:
+            others = [p for p in alive if p.uid != witch.uid]
+            if others:
+                poison_uid = random.choice(others).uid
     return heal, poison_uid
 
 
