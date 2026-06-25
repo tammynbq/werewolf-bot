@@ -85,6 +85,21 @@ async def wait_event(event: asyncio.Event, timeout: int) -> None:
         pass
 
 
+async def safe_ack(interaction: discord.Interaction, text: str) -> None:
+    """尽力给交互回一条临时消息：已响应过就用 followup，失败也吞掉不外抛。
+
+    用于投票这种「核心动作（记票）已完成，回执只是锦上添花」的场景，避免回执
+    发送失败把整个交互拖成『交互失败』。
+    """
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
 async def dm_user(uid: int, text: str) -> None:
     """私信提醒某个真人玩家（如『轮到你发言了』）。
 
@@ -404,14 +419,16 @@ class VoteSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id not in self._allowed:
-            await interaction.response.send_message("你不是存活玩家，不能投票。", ephemeral=True)
+            await safe_ack(interaction, "你不是存活玩家，不能投票。")
             return
         try:
-            self._votes[interaction.user.id] = int(self.values[0])
+            choice = int(self.values[0])
         except (ValueError, IndexError):
-            await interaction.response.send_message("没读到你的选择，请再选一次。", ephemeral=True)
+            await safe_ack(interaction, "没读到你的选择，请再选一次。")
             return
-        await interaction.response.send_message("🗳️ 已记录你的投票（可重选覆盖）。", ephemeral=True)
+        # 先把票记上（核心动作），回执用 safe_ack 尽力发送、失败也不影响计票
+        self._votes[interaction.user.id] = choice
+        await safe_ack(interaction, "🗳️ 已记录你的投票（可重选覆盖）。")
         if self._allowed and set(self._votes.keys()) >= self._allowed:
             self._parent.stop()
 
@@ -426,21 +443,23 @@ class VoteView(discord.ui.View):
     @discord.ui.button(label="结束投票并公布", style=discord.ButtonStyle.primary, emoji="⏩")
     async def finish(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.host_id:
-            await interaction.response.send_message("只有房主能提前结束投票。", ephemeral=True)
+            await safe_ack(interaction, "只有房主能提前结束投票。")
             return
-        await interaction.response.send_message("⏩ 提前结束投票，公布结果…", ephemeral=True)
+        await safe_ack(interaction, "⏩ 提前结束投票，公布结果…")
         self.stop()
 
     async def on_error(self, interaction: discord.Interaction, error: Exception,
                        item: discord.ui.Item) -> None:
         # 默认实现只打日志、不回应交互，会让玩家看到「交互失败」。这里显式反馈，
-        # 并把真实异常记到日志，方便定位（避免静默吞错）。
+        # 并把真实异常类型/信息直接展示出来（方便定位，不必翻后台日志）。
         log.exception("投票交互出错：item=%s", item, exc_info=error)
+        detail = f"{type(error).__name__}: {error}"
+        msg = f"⚠️ 投票出错：`{detail[:280]}`\n（把这行发给开发者即可定位）"
         try:
             if interaction.response.is_done():
-                await interaction.followup.send("投票时出了点问题，请再点一次。", ephemeral=True)
+                await interaction.followup.send(msg, ephemeral=True)
             else:
-                await interaction.response.send_message("投票时出了点问题，请再点一次。", ephemeral=True)
+                await interaction.response.send_message(msg, ephemeral=True)
         except discord.HTTPException:
             pass
 
