@@ -48,6 +48,9 @@ REVEAL_SECONDS: int = _int("WEREWOLF_REVEAL_SECONDS", 20)
 NPC_TEMPERATURE: float = _float("WEREWOLF_NPC_TEMPERATURE", 0.9)
 # LLM 单次调用超时（秒）：超时即走兜底，避免中转站卡死拖住整局。
 LLM_TIMEOUT_SECONDS: float = _float("WEREWOLF_LLM_TIMEOUT", 30.0)
+# LLM 全局最小调用间隔（秒）：所有 NPC 的调用串行排队、彼此至少隔这么久，
+# 把瞬时爆发摊平成细水长流，避免免费中转站的「每分钟限流」(429)。免费站建议调大。
+LLM_MIN_INTERVAL_SECONDS: float = _float("WEREWOLF_LLM_MIN_INTERVAL", 2.0)
 
 
 def validate() -> list[str]:

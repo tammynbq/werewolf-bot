@@ -40,6 +40,8 @@ class GameState:
         self.current_speaker_uid: int | None = None
         # 每晚的死亡记录（可能 0~2 人：狼刀 + 女巫毒）
         self.night_deaths: list[Player] = []
+        # 房主在大厅指定要加入本局的「角色 NPC」名字（空=不指定，自动补位）
+        self.chosen_npc_names: list[str] = []
 
     # ---------- 玩家管理 ----------
     def get(self, uid: int) -> Player | None:

@@ -18,6 +18,32 @@ log = logging.getLogger("werewolf.llm")
 # 总尝试次数 = 1 + RETRIES，每次失败后做一点退避。
 RETRIES = 2
 RETRY_BACKOFF_SECONDS = 1.2
+# 撞到 429（限流）时退避得更狠：免费站多半是「每分钟」限流，等久点才有意义。
+RATE_LIMIT_BACKOFF_SECONDS = 8.0
+
+# 全局限速闸门：所有调用先过这道闸——串行 + 强制最小间隔，把瞬时爆发摊平成
+# 细水长流，从源头避免触发中转站的每分钟限流。锁懒初始化（import 期没有事件循环）。
+_gate: asyncio.Lock | None = None
+_last_call_ts: float = 0.0
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    return status == 429 or "RateLimit" in type(exc).__name__
+
+
+async def _throttle() -> None:
+    """串行排队 + 强制最小调用间隔（config.LLM_MIN_INTERVAL_SECONDS）。"""
+    global _gate, _last_call_ts
+    if _gate is None:
+        _gate = asyncio.Lock()
+    async with _gate:
+        now = asyncio.get_event_loop().time()
+        wait = config.LLM_MIN_INTERVAL_SECONDS - (now - _last_call_ts)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_call_ts = asyncio.get_event_loop().time()
+
 
 # 懒加载单例客户端：避免在缺少 key 时一 import 就崩（缺 key 由 config.validate 兜底）。
 _client: AsyncOpenAI | None = None
@@ -83,6 +109,8 @@ async def chat(
     """
     last_exc: Exception | None = None
     for attempt in range(RETRIES + 1):
+        await _throttle()  # 先过全局限速闸，避免和其他 NPC 调用挤在一起触发限流
+        hit_rate_limit = False
         try:
             resp = await _get_client().chat.completions.create(
                 model=config.MODEL_NAME,
@@ -101,9 +129,13 @@ async def chat(
             log.warning("LLM 中转站返回空内容（第 %d/%d 次）", attempt + 1, RETRIES + 1)
         except Exception as exc:  # 网络 / 额度 / 模型名错误等
             last_exc = exc
+            hit_rate_limit = _is_rate_limit(exc)
             log.warning("LLM 中转站调用失败（第 %d/%d 次）: %s", attempt + 1, RETRIES + 1, exc)
         if attempt < RETRIES:
-            await asyncio.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+            # 限流退避更久；其他错误用渐增退避。
+            backoff = (RATE_LIMIT_BACKOFF_SECONDS if hit_rate_limit
+                       else RETRY_BACKOFF_SECONDS * (attempt + 1))
+            await asyncio.sleep(backoff)
     # 重试用尽：用 error 级别 + 人话原因，让日志一眼能看出是中转站配置/额度问题。
     if last_exc is not None:
         log.error("❌ LLM 中转站重试 %d 次仍失败 → %s（NPC 本次将沉默）",

@@ -55,11 +55,14 @@ def _set_notes(uid: int, text: str | None) -> None:
         _MEMORY[uid] = text.strip()[:600]
 
 
-def make_npcs(count: int, existing_names: set[str]) -> list[Player]:
+def make_npcs(count: int, existing_names: set[str],
+              preferred_names: list[str] | None = None) -> list[Player]:
     """生成 count 个补位 NPC，名字不与现有玩家重复。开新局时顺手清空记忆缓存。
 
-    入座顺序：先放 characters.py 里登记的「角色 NPC」（有完整人设，如 Theo），
-    名字被真人占用的跳过；不够再用通用性格 NPC 补满。负数 uid，避免与 Discord 冲突。
+    入座顺序：先放角色 NPC（有完整人设，如 Theo），名字被真人占用的跳过；
+    不够再用通用性格 NPC 补满。负数 uid，避免与 Discord 冲突。
+    - preferred_names 非空时：只优先放房主指定的这些角色（按指定顺序），其余用通用补满；
+    - 为空 / None 时：沿用默认——按 CHARACTER_NPCS 顺序优先放所有角色。
     """
     _MEMORY.clear()
     _WOLF_PLAN.clear()
@@ -67,8 +70,14 @@ def make_npcs(count: int, existing_names: set[str]) -> list[Player]:
     used_names = set(existing_names)
     next_uid = -1
 
-    # 1) 优先放有完整人设的角色 NPC
-    for ch in CHARACTER_NPCS:
+    by_name = {c.name: c for c in CHARACTER_NPCS}
+    if preferred_names:
+        char_list = [by_name[n] for n in preferred_names if n in by_name]
+    else:
+        char_list = list(CHARACTER_NPCS)
+
+    # 1) 优先放（指定的 / 全部）角色 NPC
+    for ch in char_list:
         if len(npcs) >= count:
             break
         if ch.name in used_names:
@@ -263,62 +272,60 @@ async def _decide_target(
 
 
 # ============================================================
-# 夜晚 · 预言家查验（LLM 选最有价值的目标）
+# 免费的轻量推断（不调 API）：从发言记录 / 私人笔记里抠线索
+# ============================================================
+def _scan_seer_report(state: GameState, recent_log: list[str]) -> int | None:
+    """从近期发言里找『预言家报验某座位是狼』的指认，返回该存活玩家 uid。
+
+    纯文本启发式（免费）：命中类似「3号是狼 / 3号查杀 / 验出3号是狼」的句子。
+    给好人 NPC 投票时跟票用，让『预言家报验→大家投那个狼』不花一次 API 也能实现。
+    """
+    alive_seats = {p.seat: p.uid for p in state.alive_players}
+    for line in reversed(recent_log[-24:]):
+        if "狼" not in line:
+            continue
+        if not any(k in line for k in ("验", "查杀", "预言", "金水", "踩")):
+            continue
+        # 座位号后紧跟（数字内）「…狼」，如「3号是狼」「3号查杀」
+        m = re.search(r"(\d+)\s*号[^0-9号]{0,8}狼", line)
+        if m and int(m.group(1)) in alive_seats:
+            return alive_seats[int(m.group(1))]
+    return None
+
+
+def _suspect_from_notes(voter: Player, state: GameState, exclude: set[int] = frozenset()) -> int | None:
+    """从该 NPC 自己的私人笔记里抠出它怀疑的座位号（存活、非自己、非排除），
+    让它的投票和白天发言/盘算保持一致——免费且言行一致。"""
+    notes = _notes(voter.uid)
+    if not notes:
+        return None
+    alive = {p.seat: p.uid for p in state.alive_players
+             if p.uid != voter.uid and p.uid not in exclude}
+    for m in re.finditer(r"(\d+)\s*号", notes):
+        seat = int(m.group(1))
+        if seat in alive:
+            return alive[seat]
+    return None
+
+
+# ============================================================
+# 夜晚 · 预言家查验（轻量规则，不花 API：随机查一个没查过的人）
 # ============================================================
 async def seer_check_target(seer: Player, state: GameState) -> int | None:
-    candidates = [
-        p for p in state.alive_players
-        if p.uid != seer.uid and p.uid not in seer.seer_results
-    ]
-    if not candidates:
-        candidates = [p for p in state.alive_players if p.uid != seer.uid]
-    if not candidates:
-        return None
-    valid = {p.seat: p.uid for p in candidates}
-    uid = await _decide_target(
-        seer, state,
-        role_intro="你是预言家（好人），每晚查验一人得知好/狼。要挑最有信息价值的人查："
-                   "优先查发言可疑、站边奇怪、或还没表态的关键位，别查已经基本确定的人。",
-        task="今晚你要查验谁？",
-        valid_seats=valid,
-        extra=f"已查过的结果：{_seer_checked_text(seer, state)}",
-        temperature=0.4,
-    )
-    return uid if uid is not None else _rule_seer_check(seer, state)
+    # 决策走规则省调用；预言家「会不会报验带队」由白天的 LLM 发言体现。
+    return _rule_seer_check(seer, state)
 
 
 # ============================================================
-# 夜晚 · 狼刀（LLM 选战略目标；全队当晚共用一个刀法）
+# 夜晚 · 狼刀（轻量规则，不花 API；全队当晚共用一个刀法）
 # ============================================================
 async def wolf_kill_target(state: GameState) -> int | None:
+    # 决策走规则省调用；狼队「怎么配合、刀谁」由狼人频道的 LLM 私聊体现，
+    # 且有真人狼时最终刀谁听真人队长的（在 bot.py 结算）。当晚缓存，全队一致。
     key = (id(state), state.day_count)
-    if key in _WOLF_PLAN:
-        return _WOLF_PLAN[key]
-
-    targets = [p for p in state.alive_players if not (p.role and p.role.is_wolf)]
-    if not targets:
-        _WOLF_PLAN[key] = None
-        return None
-    valid = {p.seat: p.uid for p in targets}
-
-    thinker = next((w for w in state.alive_wolves() if w.is_npc), None)
-    if thinker is None:
-        uid = _rule_wolf_kill(state)  # 没有 NPC 狼时不值得花 token
-    else:
-        mates = "、".join(f"{w.seat}号" for w in state.alive_wolves())
-        uid = await _decide_target(
-            thinker, state,
-            role_intro=f"你是狼人，狼队是[{mates}]，正在商量今晚刀谁。"
-                       "要刀掉对好人最有用的人：跳出来的预言家、疑似女巫、或带节奏的强好人，"
-                       "别刀自己队友，也别无脑刀边缘人。",
-            task="今晚刀谁？",
-            valid_seats=valid,
-            temperature=0.6,
-        )
-        if uid is None:
-            uid = _rule_wolf_kill(state)
-    _WOLF_PLAN[key] = uid
-    return uid
+    if key not in _WOLF_PLAN:
+        _WOLF_PLAN[key] = _rule_wolf_kill(state)
+    return _WOLF_PLAN[key]
 
 
 # ============================================================
@@ -327,88 +334,55 @@ async def wolf_kill_target(state: GameState) -> int | None:
 async def witch_night_action(
     witch: Player, state: GameState, victim_uid: int | None
 ) -> tuple[bool, int | None]:
-    """返回 (是否用解药救, 毒药目标 uid 或 None)。"""
+    """返回 (是否用解药救, 毒药目标 uid 或 None)。
+
+    轻量规则（不花 API，像个稳健的好人女巫）：
+    - 解药：第一晚有人被刀、且被刀的不是自己 → 救（前期人命金贵，经典打法就是救首刀）。
+      后续夜晚把解药留着，避免被狼自刀骗药。
+    - 毒药：没有可靠信息一律不毒（凭空毒人很可能毒到好人）。
+    """
     if not (witch.has_heal or witch.has_poison):
         return False, None
-
     victim = state.get(victim_uid) if victim_uid else None
-    victim_txt = f"{victim.seat}号" if victim else "今晚没人被刀（平安夜）"
-    alive_others = [p for p in state.alive_players if p.uid != witch.uid]
-    valid = {p.seat: p.uid for p in alive_others}
-    poison_list = "、".join(f"{s}号" for s in sorted(valid)) or "（无）"
-
-    system = (
-        "你正在玩中文《狼人杀》，你是女巫（好人）。你有一瓶解药(救今晚被狼刀的人)和一瓶毒药(毒死任意一人)，各只能用一次。"
-        f"当前解药：{'还在' if witch.has_heal else '已用完'}；毒药：{'还在' if witch.has_poison else '已用完'}。"
-        f"你是【{witch.seat}号】。{_persona_clause(witch)} 私人笔记：{_notes(witch.uid) or '（暂无）'}。\n"
-        "用药原则：\n"
-        "- 解药：前期(尤其第一晚)被刀的若可能是好人/神职，倾向于救；但若怀疑是狼自刀骗药可不救。\n"
-        "- 毒药：没有较大把握(比如预言家验出的狼、或几乎坐实的狼)就留着别毒，乱毒很可能毒死好人。\n"
-        "- 同一晚不要既救又毒。\n"
-        '只输出 JSON：{"heal": true或false, "poison": <要毒的座位号；不毒填0>, "reason": "<10字内理由>"}。'
+    heal = bool(
+        witch.has_heal and victim is not None
+        and victim.uid != witch.uid and state.day_count == 0
     )
-    user = (
-        f"现在是第 {state.day_count + 1} 晚。今晚被狼刀的是：{victim_txt}。\n"
-        f"存活玩家：{_alive_roster(state)}。\n"
-        f"可毒的目标：{poison_list}。\n输出 JSON："
-    )
-    data = await _ask_json(system, user, max_tokens=140, temperature=0.5)
-
-    heal = False
-    poison_uid = None
-    if not data:
-        # LLM 不可用：稳妥兜底——第一晚有人被刀就救，其余不动毒
-        if witch.has_heal and victim and victim.uid != witch.uid and state.day_count == 0:
-            heal = True
-        return heal, None
-
-    if witch.has_heal and victim is not None and victim.uid != witch.uid:
-        heal = bool(data.get("heal"))
-    if not heal and witch.has_poison:
-        seat = _coerce_seat(data.get("poison"), valid)
-        if seat:
-            poison_uid = valid[seat]
-    return heal, poison_uid
+    return heal, None
 
 
 # ============================================================
-# 白天 · 投票（所有身份都走 LLM，和当天发言保持一致）
+# 白天 · 投票（轻量规则，不花 API，但尽量像真人 / 与自己发言一致）
 # ============================================================
 async def vote_decision(voter: Player, state: GameState, recent_log: list[str]) -> int | None:
     alive_others = [p for p in state.alive_players if p.uid != voter.uid]
     if not alive_others:
         return None
-    valid = {p.seat: p.uid for p in alive_others}
 
-    # 预言家若已验出存活的狼，直接投他（确定性最高，省一次调用）
+    if voter.role is Role.WEREWOLF:
+        # 狼：别投队友；优先投自己白天盘算里框的那个好人（与发言一致），否则随机好人。
+        mates = {p.uid for p in alive_others if p.role and p.role.is_wolf}
+        suspect = _suspect_from_notes(voter, state, exclude=mates)
+        if suspect is not None:
+            return suspect
+        good = [p for p in alive_others if not (p.role and p.role.is_wolf)]
+        return random.choice(good or alive_others).uid
+
+    # 好人阵营：
+    # 1) 预言家自己验出的存活狼，直接投。
     if voter.role is Role.SEER:
         known = [p for p in alive_others if voter.seer_results.get(p.uid) is True]
         if known:
             return random.choice(known).uid
-
-    log_text = "\n".join(recent_log[-20:]) if recent_log else "（今天还没什么有效发言）"
-    if voter.role is Role.WEREWOLF:
-        intro = ("你是狼人，投票环节要把水搅浑：把一个好人推上去，别投自己狼队友。"
-                 "如果有真预言家报验了你的狼队友，别傻乎乎跟着投队友——要么装糊涂投别人、"
-                 "要么反咬预言家是假的，尽量保队友。")
-    else:
-        intro = (
-            "你是好人阵营，目标是投出狼。最重要的一条：\n"
-            "如果有人跳预言家并报验了某人是狼（类似『我是预言家，我验了X号是狼』），"
-            "而且没有别人对跳预言家、也没有更可信的反驳，就【果断跟票】把那个被验出的狼投出去"
-            "——这是好人抓狼最硬的信息，别犹豫、别另投他人。\n"
-            "如果有两个人都跳预言家（对跳），再结合双方发言逻辑判断谁是真预言家，投他指认的狼。\n"
-            "如果没人报验，才结合发言逻辑、前后矛盾、甩锅与站边，投最像狼的人。别乱投好人。")
-
-    uid = await _decide_target(
-        voter, state,
-        role_intro=intro,
-        task="现在投票放逐，你投谁？",
-        valid_seats=valid,
-        extra=f"今天的发言记录：\n{log_text}",
-        temperature=0.5,
-    )
-    return uid if uid is not None else _rule_vote(voter, state)
+    # 2) 有人跳预言家报验了某狼 → 跟票投那个狼（免费启发式解析发言）。
+    report = _scan_seer_report(state, recent_log)
+    if report is not None and report != voter.uid:
+        return report
+    # 3) 否则投自己白天盘算里最怀疑的人（与发言一致），再不行随机。
+    suspect = _suspect_from_notes(voter, state)
+    if suspect is not None:
+        return suspect
+    return random.choice(alive_others).uid
 
 
 # ============================================================

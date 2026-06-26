@@ -21,6 +21,7 @@ from discord import app_commands
 import config
 import llm
 import npc
+from characters import CHARACTER_NPCS
 from game.roles import Role, summarize_distribution
 from game.state import GameState, Phase, Team
 
@@ -483,6 +484,33 @@ class VoteGateView(discord.ui.View):
 # ============================================================
 # 大厅
 # ============================================================
+class NpcPickSelect(discord.ui.Select):
+    """房主在大厅挑选要加入本局的『角色 NPC』（多选；不选=自动补位）。"""
+
+    def __init__(self, state: GameState, lobby: "LobbyView"):
+        opts = [
+            discord.SelectOption(
+                label=c.name, value=c.name,
+                description=(c.persona.strip().splitlines()[0][:90] if c.persona else None),
+                default=(c.name in state.chosen_npc_names),
+            )
+            for c in CHARACTER_NPCS
+        ]
+        super().__init__(
+            placeholder="选择要加入本局的 AI 角色（可多选）…",
+            min_values=0, max_values=len(opts) or 1, options=opts,
+        )
+        self._state = state
+        self._lobby = lobby
+
+    async def callback(self, interaction: discord.Interaction):
+        self._state.chosen_npc_names = list(self.values)
+        picked = "、".join(self.values) if self.values else "（不指定，自动补位）"
+        await interaction.response.edit_message(
+            content=f"✅ 已设定本局 AI 角色：{picked}", view=None)
+        await self._lobby.refresh()
+
+
 class LobbyView(discord.ui.View):
     def __init__(self, bot: discord.Client, state: GameState, thread: discord.Thread | None = None):
         super().__init__(timeout=None)
@@ -511,7 +539,11 @@ class LobbyView(discord.ui.View):
         humans = self.state.humans
         roster = "\n".join(f"{i+1}. {p.mention}" for i, p in enumerate(humans)) if humans else "（还没有人加入）"
         e.add_field(name=f"已加入玩家（{len(humans)}）", value=roster, inline=False)
-        e.set_footer(text="房主：点『开始游戏』开局")
+        if CHARACTER_NPCS:
+            chosen = self.state.chosen_npc_names
+            val = "、".join(chosen) if chosen else "（未指定，自动用 AI 角色补位）"
+            e.add_field(name="🎭 指定 AI 角色", value=val, inline=False)
+        e.set_footer(text="房主：可『选 AI 角色』，再点『开始游戏』开局")
         return e
 
     async def refresh(self):
@@ -555,6 +587,26 @@ class LobbyView(discord.ui.View):
                 pass
         await interaction.response.send_message("已退出。", ephemeral=True)
         await self.refresh()
+
+    @discord.ui.button(label="选 AI 角色", style=discord.ButtonStyle.secondary, emoji="🎭")
+    async def pick_npc(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.state.host_id:
+            await interaction.response.send_message("只有房主能配置 AI 角色。", ephemeral=True)
+            return
+        if self.state.phase is not Phase.LOBBY:
+            await interaction.response.send_message("游戏已经开始了。", ephemeral=True)
+            return
+        if not CHARACTER_NPCS:
+            await interaction.response.send_message(
+                "目前还没有可选的 AI 角色（characters.py 里没登记）。", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=120)
+        view.add_item(NpcPickSelect(self.state, self))
+        await interaction.response.send_message(
+            "挑选要进本局的 AI 角色（可多选；不选则自动补位）。\n"
+            "选中的角色会优先入座，剩余空位用普通 AI 补满。",
+            view=view, ephemeral=True,
+        )
 
     @discord.ui.button(label="开始游戏", style=discord.ButtonStyle.primary, emoji="▶️")
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -936,7 +988,8 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
         need = target - len(state.players)
         if need > 0:
             existing = {p.name for p in state.players}
-            state.players.extend(npc.make_npcs(need, existing))
+            state.players.extend(
+                npc.make_npcs(need, existing, state.chosen_npc_names or None))
         if len(state.players) < 3:
             await channel.send("⚠️ 人数不足（至少 3 人），游戏取消。")
             return
