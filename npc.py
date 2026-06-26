@@ -13,6 +13,7 @@ import json
 import random
 import re
 
+import knowledge
 import llm
 from characters import CHARACTER_NPCS
 from game.player import Player
@@ -443,10 +444,11 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
         "你是一名正在玩中文桌游《狼人杀》的真人玩家，绝对不是 AI，也绝不承认自己是 AI 或跳出游戏。"
         f"你是【{player.seat}号】。{_persona_clause(player)} 你的发言要带出这个人设的语气和风格。"
         f"{_speak_strategy(player)}\n"
+        f"{knowledge.WEREWOLF_PLAYBOOK}\n"
         "要求：\n"
         "1. 像真人在群里聊天，口语自然，有情绪、有口头禅，针对具体的人用『几号』称呼(如『我觉得3号有点跳』)。\n"
         "2. 结合你的私人笔记和场上信息，发言要有逻辑、有立场、能推动局势，别说正确的废话。\n"
-        "3. say 只 1~3 句、20~70 字。\n"
+        "3. say 只 1~3 句、20~150 字（双语玩家可英文一句+中文一句，仍要简洁）。\n"
         '只输出 JSON：{"say": "<你这一句发言>", "notes": "<更新后的私人笔记：你怀疑谁/信任谁/盘算，30字内>"}。'
     )
     user = (

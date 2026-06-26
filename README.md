@@ -102,7 +102,8 @@ python bot.py
 ```
 config.py        读取环境变量（Discord / 中转站 / 游戏参数）
 llm.py           LLM 中转站客户端（OpenAI 兼容，懒加载）
-characters.py    带完整人设的「角色 NPC」登记表（如 Theo），可继续追加
+characters.py    带完整人设的「角色 NPC」登记表（Theo、闻人幸…），可继续追加
+knowledge.py     狼人杀「常识速通」手册，注入 NPC 发言提示（已按本局板子适配）
 npc.py           AI NPC：补位、规则决策、LLM 发言
 bot.py           Discord 交互层 + 游戏主流程
 game/
@@ -115,6 +116,9 @@ game/
 
 - 核心规则（`game/`）与 Discord 解耦，方便单测和扩展更多角色（女巫、猎人、守卫…）。
 - LLM 调用失败（网络/额度/模型名错误）不会让游戏崩溃，NPC 会用兜底发言继续。
-- **角色 NPC**：`characters.py` 里登记带完整人设的 AI 玩家（默认含 `Theo`），补位时
-  优先入座、说话风格稳定可辨识；要加新角色只需在 `CHARACTER_NPCS` 末尾追加一个
+- **角色 NPC**：`characters.py` 里登记带完整人设的 AI 玩家（默认含 `Theo`、`闻人幸`），
+  补位时优先入座、说话风格稳定可辨识；要加新角色只需在 `CHARACTER_NPCS` 末尾追加一个
   `Character`（`persona` 用第二人称「你是…」书写）。名字被真人占用时该角色自动让位。
+- **常识手册**：`knowledge.py` 的 `WEREWOLF_PLAYBOOK`（屠边、悍跳/倒钩/冲锋、看票型、
+  表水、轮次计算、贴脸场外是大忌…）会注入 NPC 发言提示，让 NPC 真正会用黑话、看票型；
+  已按本局板子（只有狼/预/女/民）适配，标注了警长/守卫/猎人等本局不存在的机制不要提。
