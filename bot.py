@@ -59,11 +59,32 @@ class Panel:
         self.channel = channel
         self.message: discord.Message | None = None
 
+    def _buried(self) -> bool:
+        """面板下方是否又冒出了别的消息（发言/结算/遗言等），把面板顶上去了。
+
+        面板从始至终是同一条消息、靠 edit 原地更新；可玩家发言、夜晚结算等都是
+        新发的消息，会堆在面板下面，导致面板被埋在上面、每次操作都得往上翻。
+        用频道最后一条消息是不是面板自己来判断面板有没有被顶上去。
+        """
+        if self.message is None:
+            return False
+        last_id = getattr(self.channel, "last_message_id", None)
+        return last_id is not None and last_id != self.message.id
+
     async def show(self, *, title: str, desc: str, color: int,
                    view: discord.ui.View | None = None, footer: str | None = None):
         embed = discord.Embed(title=title, description=desc, color=color)
         if footer:
             embed.set_footer(text=footer)
+        # 有按钮要点、且面板已被下面的消息顶上去时，把旧面板删掉、重新发到频道最底部，
+        # 省得玩家每次都要往上翻找按钮。纯展示更新（view=None）或面板本就在底部时就地
+        # 编辑，避免频繁删发刷屏、闪烁。
+        if self.message is not None and view is not None and self._buried():
+            try:
+                await self.message.delete()
+            except discord.HTTPException:
+                pass
+            self.message = None
         if self.message is None:
             self.message = await self.channel.send(embed=embed, view=view)
         else:
