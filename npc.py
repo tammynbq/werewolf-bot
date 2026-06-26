@@ -45,6 +45,10 @@ _PERSONAS = [
 _MEMORY: dict[int, str] = {}
 # 狼队当晚的统一刀法缓存：(id(state), day_count) -> uid，避免多只 NPC 狼各刀各的
 _WOLF_PLAN: dict[tuple, int | None] = {}
+
+# 通用发言规则：任何 NPC（无论人设）发言里出现外语，都要顺带给出中文意思，照顾中文玩家。
+_TRANSLATE_RULE = ("你的发言里只要出现任何非中文（英文句子、拉丁短语等），都必须顺带写出"
+                   "对应的中文意思，别让看中文的玩家看不懂。")
 # 每个 NPC 本轮发言时定下的「想投谁」（uid -> 座位号），让投票跟着发言走、言行一致
 _VOTE_INTENT: dict[int, int] = {}
 
@@ -495,6 +499,7 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
         "3. say 只 1~3 句、20~150 字（双语玩家可英文一句+中文一句，仍要简洁）。\n"
         "4. vote 是你此刻最想投出局谁的座位号：必须和你 say 里的立场一致（说要投谁就填谁），"
         "还没想好就填 0；小心别被悍跳的狼反咬带偏。\n"
+        f"5. {_TRANSLATE_RULE}\n"
         '只输出 JSON：{"say": "<你这一句发言>", "notes": "<更新后的私人笔记：你怀疑谁/信任谁/盘算，30字内>", '
         '"vote": <你想投的座位号数字，没想好填0>}。'
     )
@@ -546,6 +551,7 @@ async def wolf_chat(player: Player, mates: list[Player], state: GameState) -> st
         f"你是【{player.seat}号】。{_persona_clause(player)}"
         "像真人在狼队小群里聊天：简短、直接、商量口吻，可以提议刀某个具体的人、问队友意见或附和队友。"
         "只说 1~2 句、15~45 字；不要加引号、不要写名字前缀、不要 markdown、不要输出 JSON。"
+        f"{_TRANSLATE_RULE}"
     )
     user = (
         f"你的狼队友：{mate_txt}。\n"
@@ -571,6 +577,7 @@ async def last_word(player: Player, state: GameState) -> str:
         f"你是【{player.seat}号】。{_persona_clause(player)} 私人笔记：{_notes(player.uid) or '（暂无）'}。"
         "遗言要贴合身份与性格：好人可以喊话、提醒站边、给信息(预言家可以报验)；狼人可以继续伪装或卖好人。"
         "只说 1~2 句、15~50 字，口语化；不要加引号、不要写名字前缀、不要用 markdown、不要输出 JSON。"
+        f"{_TRANSLATE_RULE}"
     )
     user = (
         f"【只有你知道的秘密】{secret}\n"
