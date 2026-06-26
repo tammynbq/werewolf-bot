@@ -19,6 +19,7 @@ import discord
 from discord import app_commands
 
 import config
+import llm
 import npc
 from game.roles import Role, summarize_distribution
 from game.state import GameState, Phase, Team
@@ -1110,6 +1111,15 @@ client.tree.add_command(werewolf)
 @client.event
 async def on_ready():
     log.info("已登录为 %s（id=%s）", client.user, client.user.id)
+    # 中转站开机自检：一上线就告诉你 LLM 通不通，避免 NPC 全程沉默却查不到原因。
+    log.info("LLM 中转站配置：base_url=%s  model=%s", config.OPENAI_BASE_URL, config.MODEL_NAME)
+    ok, detail = await llm.health_check()
+    if ok:
+        log.info("✅ LLM 中转站连通正常，NPC 台词将由 LLM 实时生成。")
+    else:
+        log.error("❌ LLM 中转站不可用：%s", detail)
+        log.error("   → 此状态下 NPC 会大面积『沉默』。请检查环境变量 "
+                  "OPENAI_BASE_URL / OPENAI_API_KEY / MODEL_NAME（Railway 上同名变量）。")
 
 
 @client.event

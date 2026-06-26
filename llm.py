@@ -34,6 +34,41 @@ def _get_client() -> AsyncOpenAI:
     return _client
 
 
+def explain_error(exc: Exception) -> str:
+    """把中转站异常翻译成「人话 + 该改哪个配置」，方便看日志直接定位。"""
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    name = type(exc).__name__
+    if status == 401 or "Authentication" in name or "PermissionDenied" in name:
+        return "鉴权失败(401)：OPENAI_API_KEY 不对，或中转站不认这个 key"
+    if status == 404 or "NotFound" in name:
+        return ("找不到(404)：MODEL_NAME 不被中转站支持，"
+                "或 OPENAI_BASE_URL 路径不对（通常要以 /v1 结尾）")
+    if status == 429 or "RateLimit" in name:
+        return "限流/额度(429)：中转站额度耗尽或被限速"
+    if "Timeout" in name:
+        return f"超时(>{config.LLM_TIMEOUT_SECONDS:g}s)：中转站太慢或网络不通"
+    if "Connection" in name or "Connect" in name:
+        return "连接失败：OPENAI_BASE_URL 地址不可达（host/端口/协议是否正确？）"
+    if status:
+        return f"HTTP {status}：{exc}"
+    return f"{name}: {exc}"
+
+
+async def health_check() -> tuple[bool, str]:
+    """开机自检：打一次最小调用，确认中转站可用。返回 (是否正常, 说明)。"""
+    if not config.OPENAI_API_KEY:
+        return False, "缺少 OPENAI_API_KEY（环境变量没配）"
+    try:
+        await _get_client().chat.completions.create(
+            model=config.MODEL_NAME,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+        )
+        return True, "ok"
+    except Exception as exc:
+        return False, explain_error(exc)
+
+
 async def chat(
     system: str,
     user: str,
@@ -69,6 +104,11 @@ async def chat(
             log.warning("LLM 中转站调用失败（第 %d/%d 次）: %s", attempt + 1, RETRIES + 1, exc)
         if attempt < RETRIES:
             await asyncio.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+    # 重试用尽：用 error 级别 + 人话原因，让日志一眼能看出是中转站配置/额度问题。
     if last_exc is not None:
-        log.warning("LLM 中转站重试 %d 次仍失败，放弃本次调用", RETRIES + 1)
+        log.error("❌ LLM 中转站重试 %d 次仍失败 → %s（NPC 本次将沉默）",
+                  RETRIES + 1, explain_error(last_exc))
+    else:
+        log.error("❌ LLM 中转站连续 %d 次返回空内容，放弃本次调用（NPC 本次将沉默）",
+                  RETRIES + 1)
     return ""
