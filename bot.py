@@ -197,10 +197,19 @@ class SeerGateView(discord.ui.View):
 class WolfKillSelect(discord.ui.Select):
     def __init__(self, wolf, state: GameState, votes: dict[int, int],
                  expected: set[int], done: asyncio.Event):
-        options = [discord.SelectOption(label="🌙 空刀（今晚不杀人）", value="0")] + [
-            discord.SelectOption(label=p.label, value=str(p.uid))
-            for p in state.alive_players if not (p.role and p.role.is_wolf)
-        ]
+        # 允许自刀：狼队友和自己也可选（骗解药/搏信任的经典战术），但加标注以免误点。
+        options = [discord.SelectOption(label="🌙 空刀（今晚不杀人）", value="0")]
+        for p in state.alive_players:
+            is_wolf = bool(p.role and p.role.is_wolf)
+            if p.uid == wolf.uid:
+                opt = discord.SelectOption(
+                    label=f"{p.label}（🔪自刀·杀自己）", value=str(p.uid), emoji="🐺")
+            elif is_wolf:
+                opt = discord.SelectOption(
+                    label=f"{p.label}（🐺狼队友）", value=str(p.uid), emoji="🐺")
+            else:
+                opt = discord.SelectOption(label=p.label, value=str(p.uid))
+            options.append(opt)
         super().__init__(placeholder="选择今晚击杀的目标…", min_values=1, max_values=1, options=options)
         self._wolf = wolf
         self._state = state
