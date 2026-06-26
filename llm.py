@@ -80,6 +80,29 @@ def explain_error(exc: Exception) -> str:
     return f"{name}: {exc}"
 
 
+def _extract_content(resp) -> tuple[str, str]:
+    """从补全结果里robustly抠出正文，返回 (正文, finish_reason)。
+
+    兼容「思考型」模型：正文为空时，回退去读 reasoning_content / reasoning 字段
+    （有的中转站把内容放那儿）。finish_reason 一并返回，方便日志判断为什么空：
+    length=token不够、content_filter=被安全拦、stop但空=模型没给。
+    """
+    choice = resp.choices[0] if resp.choices else None
+    if choice is None:
+        return "", "no_choice"
+    msg = choice.message
+    finish = getattr(choice, "finish_reason", None) or "?"
+    text = (getattr(msg, "content", None) or "").strip()
+    if not text:
+        extra = getattr(msg, "model_extra", None) or {}
+        for key in ("reasoning_content", "reasoning"):
+            alt = getattr(msg, key, None) or extra.get(key)
+            if isinstance(alt, str) and alt.strip():
+                text = alt.strip()
+                break
+    return text, finish
+
+
 async def health_check() -> tuple[bool, str]:
     """开机自检：打一次最小调用，确认中转站可用。返回 (是否正常, 说明)。"""
     if not config.OPENAI_API_KEY:
@@ -107,6 +130,8 @@ async def chat(
     失败会自动重试 RETRIES 次；全部失败仍不抛异常，返回空字符串，让调用方
     自行决定如何降级（保证一局游戏不会因为 LLM 抽风而崩）。
     """
+    # 给正文留足空间：思考型模型会先吃掉一堆 token，max_tokens 太小会返回空内容。
+    effective_max = max(max_tokens, config.LLM_MIN_OUTPUT_TOKENS)
     last_exc: Exception | None = None
     for attempt in range(RETRIES + 1):
         await _throttle()  # 先过全局限速闸，避免和其他 NPC 调用挤在一起触发限流
@@ -119,14 +144,14 @@ async def chat(
                     {"role": "user", "content": user},
                 ],
                 temperature=config.NPC_TEMPERATURE if temperature is None else temperature,
-                max_tokens=max_tokens,
+                max_tokens=effective_max,
             )
-            content = resp.choices[0].message.content or ""
-            content = content.strip()
+            content, finish = _extract_content(resp)
             if content:
                 return content
-            # 空回复也当作一次失败，重试一次往往就有内容了
-            log.warning("LLM 中转站返回空内容（第 %d/%d 次）", attempt + 1, RETRIES + 1)
+            # 空回复也当作一次失败：带上 finish_reason，方便看出到底为什么空。
+            log.warning("LLM 中转站返回空内容（第 %d/%d 次, finish_reason=%s）",
+                        attempt + 1, RETRIES + 1, finish)
         except Exception as exc:  # 网络 / 额度 / 模型名错误等
             last_exc = exc
             hit_rate_limit = _is_rate_limit(exc)
