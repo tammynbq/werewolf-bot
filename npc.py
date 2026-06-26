@@ -414,14 +414,6 @@ async def vote_decision(voter: Player, state: GameState, recent_log: list[str]) 
 # ============================================================
 # 发言清洗
 # ============================================================
-_FALLBACK_LINES = [
-    "我先听听大家怎么说，目前没有特别怀疑的对象。",
-    "昨晚信息不太够，我先稳一手，别急着冲。",
-    "我是好人，希望预言家能给点信息带带我们。",
-    "刚才有人发言有点飘，我先记着，投票再看。",
-    "我觉得别急着起票，再多听两轮发言。",
-]
-
 _META_PREFIXES = (
     "context", "system", "assistant", "user", "prompt", "night", "day",
     "role", "json", "reason", "think", "你的真实身份", "当前是第", "存活玩家",
@@ -501,25 +493,19 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
         if len(say) >= 4:
             return say
 
-    # 兜底：退回到「直接要一句话」的老办法，再不行用固定兜底
+    # JSON 没解析出来时，退回到「直接要一句话」的老办法（llm.chat 内部已自带重试）。
     raw = await llm.chat(system.split("只输出 JSON")[0], user.replace("输出 JSON：", "直接说你这一句发言："))
     say = _clean_speech(raw, player)
     if len(say) >= 4:
         return say
-    return random.choice(_FALLBACK_LINES)
+    # 中转站彻底不可用：返回空串，由 bot.py 标记这名 NPC 本轮沉默，
+    # 不再用写死的台词凑数（避免「每次台词都像抽取的」）。
+    return ""
 
 
 # ============================================================
 # 夜晚 · 狼人私聊（在狼人频道商量，提议和当晚刀法一致）
 # ============================================================
-_WOLF_CHAT_FALLBACK = [
-    "我觉得先刀那个看起来像神的，别留预言家。",
-    "稳一点，今晚别空刀，挑个话多的好人下手。",
-    "你想刀谁？我都行，听你的。",
-    "别冲动，先想想明天怎么洗，刀完得对口供。",
-]
-
-
 async def wolf_chat(player: Player, mates: list[Player], state: GameState) -> str:
     """NPC 狼人在狼人私密频道里和队友商量一句（只有狼能看到）。"""
     mate_txt = "、".join(f"{m.seat}号" for m in mates) if mates else "（暂无）"
@@ -545,20 +531,12 @@ async def wolf_chat(player: Player, mates: list[Player], state: GameState) -> st
     cleaned = _clean_speech(raw, player)
     if len(cleaned) >= 4:
         return cleaned
-    return random.choice(_WOLF_CHAT_FALLBACK)
+    return ""  # 中转站不可用：本轮不发狼聊（由 bot.py 跳过），不用写死台词
 
 
 # ============================================================
 # 出局遗言
 # ============================================================
-_LAST_WORD_FALLBACK = [
-    "好人加油，把狼揪出来，别让我白死！",
-    "我走了，剩下的就靠你们了……",
-    "记住这轮的票型，别再投错好人。",
-    "唉，没想到这么快下去，盘好局势！",
-]
-
-
 async def last_word(player: Player, state: GameState) -> str:
     """出局的 NPC 留一句遗言。"""
     secret = _role_brief(player, state)
@@ -577,4 +555,4 @@ async def last_word(player: Player, state: GameState) -> str:
     cleaned = _clean_speech(raw, player)
     if len(cleaned) >= 3:
         return cleaned
-    return random.choice(_LAST_WORD_FALLBACK)
+    return ""  # 中转站不可用：返回空串，由 bot.py 显示「没有留下遗言」，不用写死台词
