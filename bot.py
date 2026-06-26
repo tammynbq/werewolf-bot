@@ -630,9 +630,9 @@ async def phase_reveal(state: GameState, panel: Panel) -> None:
 
 
 async def phase_seer(bot, state: GameState, panel: Panel) -> None:
-    # NPC 预言家先按规则查验
+    # NPC 预言家先行动（AI 选最有价值的目标查验）
     for seer in [p for p in state.alive_players if p.role is Role.SEER and p.is_npc]:
-        t = npc.seer_check_target(seer, state)
+        t = await npc.seer_check_target(seer, state)
         if t is not None:
             seer.seer_results[t] = bool(state.get(t).role.is_wolf)
 
@@ -660,9 +660,9 @@ async def phase_seer(bot, state: GameState, panel: Panel) -> None:
 async def phase_wolves(bot, state: GameState, panel: Panel, channel) -> int | None:
     """狼人夜晚，返回最终击杀目标 uid（None / 0 = 空刀）。"""
     votes: dict[int, int] = {}
-    # NPC 狼先投
+    # NPC 狼先投（AI 选战略目标；全队当晚共用一个刀法）
     for wolf in [w for w in state.alive_wolves() if w.is_npc]:
-        t = npc.wolf_kill_target(state)
+        t = await npc.wolf_kill_target(state)
         if t is not None:
             votes[wolf.uid] = t
 
@@ -695,13 +695,16 @@ async def phase_wolves(bot, state: GameState, panel: Panel, channel) -> int | No
     # 没投的真人狼兜底
     for w in state.alive_wolves():
         if w.uid not in votes:
-            t = npc.wolf_kill_target(state)
+            t = await npc.wolf_kill_target(state)
             if t is not None:
                 votes[w.uid] = t
 
     if not votes:
         return None
-    kill = Counter(votes.values()).most_common(1)[0][0]
+    # 配合真人：有真人狼出手时，最终刀谁听真人狼队长的（NPC 配合），否则取多数。
+    human_picks = [votes[w.uid] for w in state.alive_wolves()
+                   if not w.is_npc and w.uid in votes]
+    kill = human_picks[-1] if human_picks else Counter(votes.values()).most_common(1)[0][0]
     return None if kill == 0 else kill
 
 
@@ -715,7 +718,7 @@ async def phase_witch(bot, state: GameState, panel: Panel, kill_uid: int | None)
     if witch is None:
         return result
     if witch.is_npc:
-        heal, poison = npc.witch_night_action(witch, state, kill_uid)
+        heal, poison = await npc.witch_night_action(witch, state, kill_uid)
         if heal:
             witch.has_heal = False
         if poison is not None:
