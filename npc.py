@@ -355,12 +355,19 @@ async def vote_decision(voter: Player, state: GameState, recent_log: list[str]) 
         if known:
             return random.choice(known).uid
 
-    log_text = "\n".join(recent_log[-16:]) if recent_log else "（今天还没什么有效发言）"
+    log_text = "\n".join(recent_log[-20:]) if recent_log else "（今天还没什么有效发言）"
     if voter.role is Role.WEREWOLF:
-        intro = ("你是狼人，投票环节要把水搅浑：把一个好人推上去，别投自己狼队友，"
-                 "尽量顺着大家的节奏投，显得自己是好人。")
+        intro = ("你是狼人，投票环节要把水搅浑：把一个好人推上去，别投自己狼队友。"
+                 "如果有真预言家报验了你的狼队友，别傻乎乎跟着投队友——要么装糊涂投别人、"
+                 "要么反咬预言家是假的，尽量保队友。")
     else:
-        intro = "你是好人阵营，要投出今天最像狼的人：结合发言逻辑、前后矛盾、甩锅与站边判断，别乱投。"
+        intro = (
+            "你是好人阵营，目标是投出狼。最重要的一条：\n"
+            "如果有人跳预言家并报验了某人是狼（类似『我是预言家，我验了X号是狼』），"
+            "而且没有别人对跳预言家、也没有更可信的反驳，就【果断跟票】把那个被验出的狼投出去"
+            "——这是好人抓狼最硬的信息，别犹豫、别另投他人。\n"
+            "如果有两个人都跳预言家（对跳），再结合双方发言逻辑判断谁是真预言家，投他指认的狼。\n"
+            "如果没人报验，才结合发言逻辑、前后矛盾、甩锅与站边，投最像狼的人。别乱投好人。")
 
     uid = await _decide_target(
         voter, state,
@@ -424,8 +431,10 @@ def _speak_strategy(player: Player) -> str:
         return ("你是预言家：如果查到狼或局势需要，可以跳出来报验带队(说清验了谁、是好是狼)；"
                 "也可以视情况先隐藏。要让好人跟上你的信息。")
     if player.role is Role.WITCH:
-        return ("你是女巫：低调找狼，别轻易暴露身份(暴露会被狼针对)，但可以引导投票。")
-    return "你是平民：靠逻辑找狼，多分析别人的发言和票型，推动好人抓狼。"
+        return ("你是女巫：低调找狼，别轻易暴露身份(暴露会被狼针对)，但可以引导投票。"
+                "若有可信的预言家报验了狼，就声援他、号召大家投那个狼。")
+    return ("你是平民：靠逻辑找狼，多分析别人的发言和票型，推动好人抓狼。"
+            "若有人跳预言家报验了某人是狼且没人对跳，就明确表态跟他、号召一起投那个狼。")
 
 
 async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
