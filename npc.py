@@ -45,6 +45,8 @@ _PERSONAS = [
 _MEMORY: dict[int, str] = {}
 # 狼队当晚的统一刀法缓存：(id(state), day_count) -> uid，避免多只 NPC 狼各刀各的
 _WOLF_PLAN: dict[tuple, int | None] = {}
+# 每个 NPC 本轮发言时定下的「想投谁」（uid -> 座位号），让投票跟着发言走、言行一致
+_VOTE_INTENT: dict[int, int] = {}
 
 
 def _notes(uid: int) -> str:
@@ -54,6 +56,33 @@ def _notes(uid: int) -> str:
 def _set_notes(uid: int, text: str | None) -> None:
     if text and isinstance(text, str):
         _MEMORY[uid] = text.strip()[:600]
+
+
+def _set_vote_intent(uid: int, vote) -> None:
+    """记下这名 NPC 发言时表态要投的座位号（0/解析失败=没想好，清掉旧意向）。"""
+    seat = 0
+    try:
+        # 容忍 "5" / "5号" / 5 等写法
+        m = re.search(r"\d+", str(vote))
+        if m:
+            seat = int(m.group())
+    except (TypeError, ValueError):
+        seat = 0
+    if seat > 0:
+        _VOTE_INTENT[uid] = seat
+    else:
+        _VOTE_INTENT.pop(uid, None)
+
+
+def _vote_intent_uid(voter: Player, state: GameState,
+                     exclude: set[int] = frozenset()) -> int | None:
+    """把发言时定下的投票意向（座位号）解析成存活、非自己、非排除的目标 uid。"""
+    seat = _VOTE_INTENT.get(voter.uid)
+    if not seat:
+        return None
+    target = next((p for p in state.alive_players
+                   if p.seat == seat and p.uid != voter.uid and p.uid not in exclude), None)
+    return target.uid if target else None
 
 
 def make_npcs(count: int, existing_names: set[str],
@@ -67,6 +96,7 @@ def make_npcs(count: int, existing_names: set[str],
     """
     _MEMORY.clear()
     _WOLF_PLAN.clear()
+    _VOTE_INTENT.clear()
     npcs: list[Player] = []
     used_names = set(existing_names)
     next_uid = -1
@@ -282,6 +312,7 @@ def _scan_seer_report(state: GameState, recent_log: list[str]) -> int | None:
     给好人 NPC 投票时跟票用，让『预言家报验→大家投那个狼』不花一次 API 也能实现。
     """
     alive_seats = {p.seat: p.uid for p in state.alive_players}
+    hits: list[int] = []
     for line in reversed(recent_log[-24:]):
         if "狼" not in line:
             continue
@@ -290,7 +321,12 @@ def _scan_seer_report(state: GameState, recent_log: list[str]) -> int | None:
         # 座位号后紧跟（数字内）「…狼」，如「3号是狼」「3号查杀」
         m = re.search(r"(\d+)\s*号[^0-9号]{0,8}狼", line)
         if m and int(m.group(1)) in alive_seats:
-            return alive_seats[int(m.group(1))]
+            hits.append(int(m.group(1)))
+    # 出现「对跳/互咬」——多个不同座位都被指认成狼，信息互相冲突，不盲目跟票，
+    # 交给上层的发言意向/笔记去判断，免得被悍跳的狼利用规则带歪。
+    distinct = set(hits)
+    if len(distinct) == 1:
+        return alive_seats[hits[0]]
     return None
 
 
@@ -361,8 +397,11 @@ async def vote_decision(voter: Player, state: GameState, recent_log: list[str]) 
         return None
 
     if voter.role is Role.WEREWOLF:
-        # 狼：别投队友；优先投自己白天盘算里框的那个好人（与发言一致），否则随机好人。
+        # 狼：别投队友。优先跟自己发言里的表态（嫁祸的那个好人），再退而求其次。
         mates = {p.uid for p in alive_others if p.role and p.role.is_wolf}
+        intent = _vote_intent_uid(voter, state, exclude=mates)
+        if intent is not None:
+            return intent
         suspect = _suspect_from_notes(voter, state, exclude=mates)
         if suspect is not None:
             return suspect
@@ -370,16 +409,21 @@ async def vote_decision(voter: Player, state: GameState, recent_log: list[str]) 
         return random.choice(good or alive_others).uid
 
     # 好人阵营：
-    # 1) 预言家自己验出的存活狼，直接投。
+    # 1) 预言家自己验出的存活狼是铁信息，直接投。
     if voter.role is Role.SEER:
         known = [p for p in alive_others if voter.seer_results.get(p.uid) is True]
         if known:
             return random.choice(known).uid
-    # 2) 有人跳预言家报验了某狼 → 跟票投那个狼（免费启发式解析发言）。
+    # 2) 投自己发言里明确表态要投的人——言行一致，且这是 LLM 综合全场（含对悍跳的判断）
+    #    后的立场，优先级高于机械跟票，免得被狼一句『X号是狼』反咬带偏。
+    intent = _vote_intent_uid(voter, state)
+    if intent is not None:
+        return intent
+    # 3) 没给明确意向时，才退回启发式：有人跳预言家报验了某狼且场面没对跳冲突 → 跟票。
     report = _scan_seer_report(state, recent_log)
     if report is not None and report != voter.uid:
         return report
-    # 3) 否则投自己白天盘算里最怀疑的人（与发言一致），再不行随机。
+    # 4) 再不行投自己笔记里最怀疑的人，最后随机。
     suspect = _suspect_from_notes(voter, state)
     if suspect is not None:
         return suspect
@@ -449,7 +493,10 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
         "1. 像真人在群里聊天，口语自然，有情绪、有口头禅，针对具体的人用『几号』称呼(如『我觉得3号有点跳』)。\n"
         "2. 结合你的私人笔记和场上信息，发言要有逻辑、有立场、能推动局势，别说正确的废话。\n"
         "3. say 只 1~3 句、20~150 字（双语玩家可英文一句+中文一句，仍要简洁）。\n"
-        '只输出 JSON：{"say": "<你这一句发言>", "notes": "<更新后的私人笔记：你怀疑谁/信任谁/盘算，30字内>"}。'
+        "4. vote 是你此刻最想投出局谁的座位号：必须和你 say 里的立场一致（说要投谁就填谁），"
+        "还没想好就填 0；小心别被悍跳的狼反咬带偏。\n"
+        '只输出 JSON：{"say": "<你这一句发言>", "notes": "<更新后的私人笔记：你怀疑谁/信任谁/盘算，30字内>", '
+        '"vote": <你想投的座位号数字，没想好填0>}。'
     )
     user = (
         f"【只有你知道的秘密】{secret}\n"
@@ -460,9 +507,12 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
         f"轮到你（{player.seat}号）了，先想再说，输出 JSON："
     )
 
+    # 先清掉上一轮的投票意向；这次发言解析成功才会重新定下，避免兜底沉默时残留旧意向
+    _VOTE_INTENT.pop(player.uid, None)
     data = await _ask_json(system, user, max_tokens=240, temperature=0.9)
     if data:
         _set_notes(player.uid, data.get("notes"))
+        _set_vote_intent(player.uid, data.get("vote"))  # 让投票跟着这次发言的立场走
         say = _clean_speech(str(data.get("say") or ""), player)
         if say and any(say in p.name for p in state.players if len(p.name) >= 3):
             say = ""
