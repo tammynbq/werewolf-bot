@@ -14,6 +14,7 @@ import random
 import re
 
 import llm
+from characters import CHARACTER_NPCS
 from game.player import Player
 from game.roles import Role
 from game.state import GameState
@@ -55,23 +56,53 @@ def _set_notes(uid: int, text: str | None) -> None:
 
 
 def make_npcs(count: int, existing_names: set[str]) -> list[Player]:
-    """生成 count 个补位 NPC，名字不与现有玩家重复。开新局时顺手清空记忆缓存。"""
+    """生成 count 个补位 NPC，名字不与现有玩家重复。开新局时顺手清空记忆缓存。
+
+    入座顺序：先放 characters.py 里登记的「角色 NPC」（有完整人设，如 Theo），
+    名字被真人占用的跳过；不够再用通用性格 NPC 补满。负数 uid，避免与 Discord 冲突。
+    """
     _MEMORY.clear()
     _WOLF_PLAN.clear()
-    names = [n for n in _NPC_NAMES if n not in existing_names]
-    random.shuffle(names)
     npcs: list[Player] = []
-    for i in range(count):
-        name = names[i] if i < len(names) else f"NPC{i + 1}"
+    used_names = set(existing_names)
+    next_uid = -1
+
+    # 1) 优先放有完整人设的角色 NPC
+    for ch in CHARACTER_NPCS:
+        if len(npcs) >= count:
+            break
+        if ch.name in used_names:
+            continue  # 名字被真人占了，让给真人
+        npcs.append(Player(uid=next_uid, name=ch.name, is_npc=True, persona=ch.persona))
+        used_names.add(ch.name)
+        next_uid -= 1
+
+    # 2) 不够的用通用性格 NPC 补满
+    pool = [n for n in _NPC_NAMES if n not in used_names]
+    random.shuffle(pool)
+    while len(npcs) < count:
+        name = pool.pop() if pool else f"NPC{len(npcs) + 1}"
+        if name in used_names:
+            continue
         npcs.append(
             Player(
-                uid=-(i + 1),  # 负数 id，避免与 Discord user id 冲突
+                uid=next_uid,
                 name=name,
                 is_npc=True,
                 persona=random.choice(_PERSONAS),
             )
         )
+        used_names.add(name)
+        next_uid -= 1
+
     return npcs
+
+
+def _persona_clause(player: Player) -> str:
+    """把人设渲染进 system 提示：通用 NPC 是一句性格，角色 NPC 是整段人物设定，
+    统一成「你的人设：…」一个块，措辞与人称对齐（全程用「你」称呼这名玩家）。"""
+    text = (player.persona or "").strip() or "普通玩家，性格随和、就事论事。"
+    return f"你的人设：{text}"
 
 
 # ============================================================
@@ -218,7 +249,7 @@ async def _decide_target(
     seat_list = "、".join(f"{s}号" for s in sorted(valid_seats))
     system = (
         f"你正在玩中文《狼人杀》。{role_intro} "
-        f"你是【{player.seat}号】，性格「{player.persona}」。"
+        f"你是【{player.seat}号】。{_persona_clause(player)}"
         f"你的私人笔记：{_notes(player.uid) or '（暂无）'}。"
         "请像有脑子的老玩家一样认真推理后再决定，别乱选。"
         '只输出 JSON：{"target": <座位号数字>, "reason": "<10字内理由>"}，不要任何多余内容。'
@@ -309,7 +340,7 @@ async def witch_night_action(
     system = (
         "你正在玩中文《狼人杀》，你是女巫（好人）。你有一瓶解药(救今晚被狼刀的人)和一瓶毒药(毒死任意一人)，各只能用一次。"
         f"当前解药：{'还在' if witch.has_heal else '已用完'}；毒药：{'还在' if witch.has_poison else '已用完'}。"
-        f"你是【{witch.seat}号】，性格「{witch.persona}」。私人笔记：{_notes(witch.uid) or '（暂无）'}。\n"
+        f"你是【{witch.seat}号】。{_persona_clause(witch)} 私人笔记：{_notes(witch.uid) or '（暂无）'}。\n"
         "用药原则：\n"
         "- 解药：前期(尤其第一晚)被刀的若可能是好人/神职，倾向于救；但若怀疑是狼自刀骗药可不救。\n"
         "- 毒药：没有较大把握(比如预言家验出的狼、或几乎坐实的狼)就留着别毒，乱毒很可能毒死好人。\n"
@@ -444,7 +475,7 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
 
     system = (
         "你是一名正在玩中文桌游《狼人杀》的真人玩家，绝对不是 AI，也绝不承认自己是 AI 或跳出游戏。"
-        f"你是【{player.seat}号】，性格「{player.persona}」，发言要带出这种性格。"
+        f"你是【{player.seat}号】。{_persona_clause(player)} 你的发言要带出这个人设的语气和风格。"
         f"{_speak_strategy(player)}\n"
         "要求：\n"
         "1. 像真人在群里聊天，口语自然，有情绪、有口头禅，针对具体的人用『几号』称呼(如『我觉得3号有点跳』)。\n"
@@ -500,7 +531,7 @@ async def wolf_chat(player: Player, mates: list[Player], state: GameState) -> st
     plan_txt = f"{state.get(plan).seat}号" if plan and state.get(plan) else "还没定"
     system = (
         "你正在玩中文《狼人杀》，你是狼人，现在在只有狼队友能看到的私密狼人频道里商量今晚刀谁。"
-        f"你是【{player.seat}号】，性格「{player.persona}」。"
+        f"你是【{player.seat}号】。{_persona_clause(player)}"
         "像真人在狼队小群里聊天：简短、直接、商量口吻，可以提议刀某个具体的人、问队友意见或附和队友。"
         "只说 1~2 句、15~45 字；不要加引号、不要写名字前缀、不要 markdown、不要输出 JSON。"
     )
@@ -533,7 +564,7 @@ async def last_word(player: Player, state: GameState) -> str:
     secret = _role_brief(player, state)
     system = (
         "你正在玩中文《狼人杀》，扮演一名刚刚出局的玩家，现在留一句简短遗言，绝不承认自己是 AI。"
-        f"你是【{player.seat}号】，性格「{player.persona}」。私人笔记：{_notes(player.uid) or '（暂无）'}。"
+        f"你是【{player.seat}号】。{_persona_clause(player)} 私人笔记：{_notes(player.uid) or '（暂无）'}。"
         "遗言要贴合身份与性格：好人可以喊话、提醒站边、给信息(预言家可以报验)；狼人可以继续伪装或卖好人。"
         "只说 1~2 句、15~50 字，口语化；不要加引号、不要写名字前缀、不要用 markdown、不要输出 JSON。"
     )
