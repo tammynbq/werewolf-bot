@@ -51,9 +51,10 @@ LLM_TIMEOUT_SECONDS: float = _float("WEREWOLF_LLM_TIMEOUT", 30.0)
 # LLM 全局最小调用间隔（秒）：所有 NPC 的调用串行排队、彼此至少隔这么久，
 # 把瞬时爆发摊平成细水长流，避免免费中转站的「每分钟限流」(429)。免费站建议调大。
 LLM_MIN_INTERVAL_SECONDS: float = _float("WEREWOLF_LLM_MIN_INTERVAL", 2.0)
-# 单次输出 token 下限：有些「思考型」模型会先花一堆 token 思考，max_tokens 太小会导致
-# 正文还没开始就没额度、返回空内容。给个下限保证正文有空间（思考型模型建议调大到 1024+）。
-LLM_MIN_OUTPUT_TOKENS: int = _int("WEREWOLF_LLM_MIN_OUTPUT_TOKENS", 800)
+# 单次输出 token 下限：有些「思考型」模型会先花一大段 token 思考，额度太小会导致
+# 正文还没开始就被截断(finish_reason=length)、返回空内容。给足下限让它「想完还能答」。
+# 默认 6000：按次计费、不在乎 token 量时给足空间最稳；按量计费可用环境变量调小。
+LLM_MIN_OUTPUT_TOKENS: int = _int("WEREWOLF_LLM_MIN_OUTPUT_TOKENS", 6000)
 
 
 def validate() -> list[str]:
