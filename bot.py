@@ -19,6 +19,7 @@ import discord
 from discord import app_commands
 
 import config
+import llm
 import npc
 from game.roles import Role, summarize_distribution
 from game.state import GameState, Phase, Team
@@ -688,7 +689,8 @@ async def phase_wolves(bot, state: GameState, panel: Panel, channel) -> int | No
                 mates = [m for m in state.alive_wolves() if m.uid != nw.uid]
                 try:
                     line = await npc.wolf_chat(nw, mates, state)
-                    await thread.send(f"🐺 **{nw.label}**：{line}")
+                    if line:  # LLM 不可用时返回空串，本轮就不发狼聊
+                        await thread.send(f"🐺 **{nw.label}**：{line}")
                 except discord.HTTPException:
                     pass
         done = asyncio.Event()
@@ -753,7 +755,10 @@ async def collect_last_words(state: GameState, panel: Panel, channel, player) ->
     """出局玩家留遗言：NPC 由 LLM 生成；真人通过面板弹窗输入。"""
     if player.is_npc:
         text = await npc.last_word(player, state)
-        await channel.send(f"🪦 **{player.label}** 的遗言：{text}")
+        if text:
+            await channel.send(f"🪦 **{player.label}** 的遗言：{text}")
+        else:  # LLM 不可用时返回空串，按真人沉默同款措辞处理
+            await channel.send(f"（{player.label} 没有留下遗言。）")
         return
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
@@ -813,8 +818,12 @@ async def phase_discussion(bot, state: GameState, panel: Panel, channel, day_log
             async with channel.typing():
                 speech = await npc.speak(player, state, day_log)
                 await asyncio.sleep(min(9.0, 1.5 + len(speech) * 0.12))
-            await channel.send(f"💬 **{player.label}**：{speech}")
-            day_log.append(f"{player.seat}号: {speech}")
+            if speech:
+                await channel.send(f"💬 **{player.label}**：{speech}")
+                day_log.append(f"{player.seat}号: {speech}")
+            else:  # LLM 不可用时返回空串，标记沉默而不是凑写死台词
+                await channel.send(f"（{player.label} 一时没接上话，跳过发言。）")
+                day_log.append(f"{player.seat}号: （沉默）")
             await asyncio.sleep(0.6)
         else:
             loop = asyncio.get_running_loop()
@@ -1102,6 +1111,15 @@ client.tree.add_command(werewolf)
 @client.event
 async def on_ready():
     log.info("已登录为 %s（id=%s）", client.user, client.user.id)
+    # 中转站开机自检：一上线就告诉你 LLM 通不通，避免 NPC 全程沉默却查不到原因。
+    log.info("LLM 中转站配置：base_url=%s  model=%s", config.OPENAI_BASE_URL, config.MODEL_NAME)
+    ok, detail = await llm.health_check()
+    if ok:
+        log.info("✅ LLM 中转站连通正常，NPC 台词将由 LLM 实时生成。")
+    else:
+        log.error("❌ LLM 中转站不可用：%s", detail)
+        log.error("   → 此状态下 NPC 会大面积『沉默』。请检查环境变量 "
+                  "OPENAI_BASE_URL / OPENAI_API_KEY / MODEL_NAME（Railway 上同名变量）。")
 
 
 @client.event
