@@ -534,6 +534,25 @@ def _speak_strategy(player: Player) -> str:
             "若有人跳预言家报验了某人是狼且没人对跳，就明确表态跟他、号召一起投那个狼。")
 
 
+# 暗号机制：人设里埋了「往哪边吹」暗号的角色（如崽崽），发言时按硬规则收发——
+# 没人说过就主动抛暗号「往哪边吹？」，有人说过就回应「吹到……」。靠强制指令 + 兜底补全，
+# 比纯靠 persona 软提示可靠得多。
+_PASSCODE_MARK = "往哪边吹"
+_PASSCODE_ASK_KEYS = ("往哪边吹", "往哪吹", "往哪儿吹", "吹去哪", "吹到哪", "风往哪")
+
+
+def _passcode_directive(player: Player, recent_log: list[str]) -> tuple[str, str]:
+    """该 NPC 人设里若埋了暗号，返回(注入提示的强制指令, 模式)；模式 ask/respond/''。"""
+    if _PASSCODE_MARK not in (player.persona or ""):
+        return "", ""
+    blob = "\n".join(recent_log)
+    if any(k in blob for k in _PASSCODE_ASK_KEYS):
+        return ("【暗号·强制】场上已经有人说过暗号「往哪边吹」之类的话——你必须把回应暗号"
+                "「吹到……」(后面的地名/方向自己填、别突兀)自然地融进这句发言里。", "respond")
+    return ("【暗号·强制】目前还没人提过暗号——你这句发言的结尾要像随口一问那样，"
+            "自然地抛出一句暗号「往哪边吹？」。", "ask")
+
+
 async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
     """让 NPC 先盘算再发言：输出 JSON {say, notes}，发言与思路一致，并更新私人笔记。"""
     secret = _role_brief(player, state)
@@ -556,12 +575,14 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
         '只输出 JSON：{"say": "<你这一句发言>", "notes": "<更新后的私人笔记：你怀疑谁/信任谁/盘算，30字内>", '
         '"vote": <你想投的座位号数字，没想好填0>}。'
     )
+    pass_directive, pass_mode = _passcode_directive(player, recent_log)
     user = (
         f"【只有你知道的秘密】{secret}\n"
         f"你的私人笔记：{_notes(player.uid) or '（暂无）'}\n"
         f"现在是第 {state.day_count} 天白天，大家按座位号轮流发言。\n"
         f"本局存活玩家：{_alive_roster(state)}。\n"
-        f"目前为止的场上发言与信息：\n{log_text}\n\n"
+        f"目前为止的场上发言与信息：\n{log_text}\n"
+        f"{pass_directive}\n"
         f"轮到你（{player.seat}号）了，快速判断、别钻牛角尖：想清楚立场就直接给出 say，"
         f"notes 也只写要点、别长篇推理。直接输出 JSON："
     )
@@ -576,6 +597,9 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
         if say and any(say in p.name for p in state.players if len(p.name) >= 3):
             say = ""
         if len(say) >= 4:
+            # 暗号兜底：ask 模式模型若漏了暗号，补一句保证抛出；respond 交给上面的强制指令
+            if pass_mode == "ask" and "吹" not in say:
+                say = say.rstrip("。.!！…~～ ") + "。……对了，往哪边吹？"
             return say
 
     # JSON 没解析出来时，退回到「直接要一句话」的老办法（llm.chat 内部已自带重试）。
