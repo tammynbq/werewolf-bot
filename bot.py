@@ -59,11 +59,45 @@ class Panel:
         self.channel = channel
         self.message: discord.Message | None = None
 
+    def _buried(self) -> bool:
+        """面板下方是否又冒出了别的消息（发言/结算/遗言等），把面板顶上去了。
+
+        面板从始至终是同一条消息、靠 edit 原地更新；可玩家发言、夜晚结算等都是
+        新发的消息，会堆在面板下面，导致面板被埋在上面、每次操作都得往上翻。
+        用频道最后一条消息是不是面板自己来判断面板有没有被顶上去。
+        """
+        if self.message is None:
+            return False
+        last_id = getattr(self.channel, "last_message_id", None)
+        return last_id is not None and last_id != self.message.id
+
+    async def ensure_bottom(self) -> None:
+        """若面板已被下面的消息顶上去，删掉旧的，下次 show() 会重新发到频道底部。
+
+        在「接下来全靠面板就地刷新、不再发新消息」的环节（如白天发言）开始前调用一次，
+        让面板先归位到最底部，之后整段就地编辑都稳稳停在底部，玩家不用再往上翻。
+        """
+        if self.message is not None and self._buried():
+            try:
+                await self.message.delete()
+            except discord.HTTPException:
+                pass
+            self.message = None
+
     async def show(self, *, title: str, desc: str, color: int,
                    view: discord.ui.View | None = None, footer: str | None = None):
         embed = discord.Embed(title=title, description=desc, color=color)
         if footer:
             embed.set_footer(text=footer)
+        # 有按钮要点、且面板已被下面的消息顶上去时，把旧面板删掉、重新发到频道最底部，
+        # 省得玩家每次都要往上翻找按钮。纯展示更新（view=None）或面板本就在底部时就地
+        # 编辑，避免频繁删发刷屏、闪烁。
+        if self.message is not None and view is not None and self._buried():
+            try:
+                await self.message.delete()
+            except discord.HTTPException:
+                pass
+            self.message = None
         if self.message is None:
             self.message = await self.channel.send(embed=embed, view=view)
         else:
@@ -71,12 +105,29 @@ class Panel:
             await self.message.edit(embed=embed, view=view)
 
 
-def roster_block(state: GameState) -> str:
-    """存活玩家清单（带座位号），夜晚/白天面板都用。"""
+def _speech_preview(text: str, limit: int = 350) -> str:
+    """把发言压成一行显示在灯旁边；过长则截断，避免 embed 超长。"""
+    text = (text or "").strip().replace("\n", " ")
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def roster_block(state: GameState, *, speeches: bool = False,
+                 speaking_uid: int | None = None) -> str:
+    """存活玩家清单（带座位号）：🟢存活 / ⚫出局，夜晚/白天面板都用。
+
+    speeches=True 时把每人本轮的发言/遗言直接显示在灯旁边（面板模式：发言不再
+    另发消息往下堆），speaking_uid 指向的玩家显示「发言中…」。
+    """
     lines = []
     for p in state.players:
         mark = "🟢" if p.alive else "⚫"
-        lines.append(f"{mark} {p.label}")
+        line = f"{mark} {p.label}"
+        if speeches:
+            if p.uid == speaking_uid:
+                line += "：💬 发言中…"
+            elif p.last_speech:
+                line += f"：{_speech_preview(p.last_speech)}"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -699,7 +750,8 @@ async def phase_seer(bot, state: GameState, panel: Panel) -> None:
             seer.seer_results[t] = bool(state.get(t).role.is_wolf)
 
     seer = state.alive_seer()
-    desc = "🔮 **预言家请睁眼**，查验一名玩家的身份。\n其他人请闭眼等待。"
+    desc = ("🔮 **预言家请睁眼**，查验一名玩家的身份。\n其他人请闭眼等待。\n\n"
+            + roster_block(state))
     if seer is None:
         await panel.show(title="🌙 第 %d 夜 · 预言家" % (state.day_count + 1),
                          desc="🔮 预言家请行动……（夜色中似乎没有动静）", color=C_NIGHT)
@@ -730,7 +782,8 @@ async def phase_wolves(bot, state: GameState, panel: Panel, channel) -> int | No
 
     human_wolves = {w.uid for w in state.alive_wolves() if not w.is_npc}
     title = "🌙 第 %d 夜 · 狼人" % (state.day_count + 1)
-    desc = "🐺 **狼人请睁眼**，和队友商量后选择今晚要击杀的目标。\n其他人请闭眼等待。"
+    desc = ("🐺 **狼人请睁眼**，和队友商量后选择今晚要击杀的目标。\n其他人请闭眼等待。\n\n"
+            + roster_block(state))
 
     if human_wolves:
         thread = await ensure_wolf_thread(bot, state, channel)
@@ -795,7 +848,8 @@ async def phase_witch(bot, state: GameState, panel: Panel, kill_uid: int | None)
     view = WitchGateView(state, victim, result, done, timeout=TURN)
     await panel.show(
         title=title,
-        desc="🧪 **女巫请睁眼**。点下方按钮查看今晚情况，并决定是否用药。\n其他人请闭眼等待。",
+        desc=("🧪 **女巫请睁眼**。点下方按钮查看今晚情况，并决定是否用药。\n其他人请闭眼等待。\n\n"
+              + roster_block(state)),
         color=C_NIGHT, view=view, footer="女巫：点『女巫行动』",
     )
     await wait_event(done, TURN)
@@ -803,14 +857,14 @@ async def phase_witch(bot, state: GameState, panel: Panel, kill_uid: int | None)
     return result
 
 
-async def collect_last_words(state: GameState, panel: Panel, channel, player) -> None:
-    """出局玩家留遗言：NPC 由 LLM 生成；真人通过面板弹窗输入。"""
+async def collect_last_words(state: GameState, panel: Panel, channel, player,
+                             title: str = "🪦 遗言") -> None:
+    """出局玩家留遗言：NPC 由 LLM 生成；真人通过面板弹窗输入。
+    遗言同样落在面板里出局者的 ⚫ 灯旁边，不再往下另发消息。"""
     if player.is_npc:
         text = await npc.last_word(player, state)
-        if text:
-            await channel.send(f"🪦 **{player.label}** 的遗言：{text}")
-        else:  # LLM 不可用时返回空串，按真人沉默同款措辞处理
-            await channel.send(f"（{player.label} 没有留下遗言。）")
+        player.last_speech = f"🪦 {text}" if text else "🪦 （没有留下遗言）"
+        await panel.show(title=title, desc=roster_block(state, speeches=True), color=C_DAY)
         return
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
@@ -818,64 +872,75 @@ async def collect_last_words(state: GameState, panel: Panel, channel, player) ->
     view = SpeechGateView(player, fut, btn_label="留遗言", modal_title="你的遗言",
                           input_label="留下你的遗言（可留空）", timeout=SPEAK)
     await dm_user(player.uid, f"🪦 你（{player.seat}号）出局了，回到游戏面板点『留遗言』留下遗言吧。")
+    await panel.ensure_bottom()
     await panel.show(
-        title="🪦 遗言",
-        desc=f"**{player.label}** 出局了，请点按钮留下遗言（不限时，留完即继续）。",
+        title=title,
+        desc=(roster_block(state, speeches=True, speaking_uid=player.uid)
+              + f"\n\n🪦 **{player.label}** 出局了，点按钮留下遗言（留完即继续）。"),
         color=C_DAY, view=view,
     )
     try:
         text = await asyncio.wait_for(fut, timeout=SPEAK)
-        if text.strip():
-            await channel.send(f"🪦 **{player.label}** 的遗言：{text}")  # label 已是匿名座位号
-        else:
-            await channel.send(f"（{player.label} 没有留下遗言。）")
+        player.last_speech = f"🪦 {text}" if text.strip() else "🪦 （没有留下遗言）"
     except asyncio.TimeoutError:
-        await channel.send(f"（{player.label} 没有留下遗言。）")
+        player.last_speech = "🪦 （没有留下遗言）"
     finally:
         state.current_speaker_uid = None
         view.stop()
+    await panel.show(title=title, desc=roster_block(state, speeches=True), color=C_DAY)
 
 
 async def announce_deaths(state: GameState, panel: Panel, channel, deaths: list, day_log: list[str]) -> None:
+    title = "🌅 第 %d 天 · 天亮了" % state.day_count
+    # 新的一天：清掉上一轮显示在灯旁的发言，面板从干净的灯牌开始
+    for p in state.players:
+        p.last_speech = ""
     if not deaths:
-        await panel.show(title="🌅 第 %d 天 · 天亮了" % state.day_count,
+        await panel.show(title=title,
                          desc="昨晚是**平安夜**，无人死亡。\n\n" + roster_block(state), color=C_DAY)
         day_log.append(f"第{state.day_count}晚，平安夜。")
         await asyncio.sleep(2)
         return
     names = "、".join(d.label for d in deaths)
-    await panel.show(title="🌅 第 %d 天 · 天亮了" % state.day_count,
+    await panel.show(title=title,
                      desc=f"昨晚倒下的是：**{names}**。\n\n" + roster_block(state), color=C_DAY)
     for d in deaths:
         day_log.append(f"第{state.day_count}晚，{d.seat}号出局。")
     await asyncio.sleep(1.5)
     for d in deaths:
-        await collect_last_words(state, panel, channel, d)
+        await collect_last_words(state, panel, channel, d, title=title)
 
 
 async def phase_discussion(bot, state: GameState, panel: Panel, channel, day_log: list[str]) -> None:
+    title = "☀️ 第 %d 天 · 讨论" % state.day_count
     order = list(state.alive_players)
     order_txt = " → ".join(f"{p.seat}号" for p in order)
+    # 整段讨论只靠面板就地刷新（发言显示在灯旁边、不再往下发消息），先把面板归位到
+    # 频道底部，之后玩家就不用往上翻找面板了。
+    await panel.ensure_bottom()
     for player in order:
         if not player.alive:
             continue
         if player.is_npc:
             state.current_speaker_uid = None
+            # 该 NPC 这格先标「发言中…」，其余人保留各自已说的话
             await panel.show(
-                title="☀️ 第 %d 天 · 讨论" % state.day_count,
-                desc=f"轮到 **{player.label}** 发言…\n\n📋 顺序：{order_txt}",
-                color=C_DAY, footer="按座位号轮流发言",
+                title=title,
+                desc=roster_block(state, speeches=True, speaking_uid=player.uid),
+                color=C_DAY, footer=f"按座位号轮流发言　{order_txt}",
             )
             # 先生成发言，再按字数模拟「真人打字」的停顿，避免 NPC 秒回暴露身份
             async with channel.typing():
                 speech = await npc.speak(player, state, day_log)
                 await asyncio.sleep(min(9.0, 1.5 + len(speech) * 0.12))
             if speech:
-                await channel.send(f"💬 **{player.label}**：{speech}")
+                player.last_speech = speech
                 day_log.append(f"{player.seat}号: {speech}")
             else:  # LLM 不可用时返回空串，标记沉默而不是凑写死台词
-                await channel.send(f"（{player.label} 一时没接上话，跳过发言。）")
+                player.last_speech = "（一时没接上话，跳过发言）"
                 day_log.append(f"{player.seat}号: （沉默）")
+            await panel.show(title=title, desc=roster_block(state, speeches=True),
+                             color=C_DAY, footer=f"按座位号轮流发言　{order_txt}")
             await asyncio.sleep(0.6)
         else:
             loop = asyncio.get_running_loop()
@@ -885,26 +950,29 @@ async def phase_discussion(bot, state: GameState, panel: Panel, channel, day_log
                                   input_label="输入你的发言", timeout=SPEAK)
             await dm_user(player.uid, f"🎤 轮到你（{player.seat}号）发言了，回游戏面板点『我要发言』吧。")
             await panel.show(
-                title="☀️ 第 %d 天 · 讨论" % state.day_count,
-                desc=(f"🎤 现在轮到 **{player.seat}号** 发言（请对号入座，只有本人能点发言）。\n"
-                      f"已私信提醒当事人；点下方按钮输入发言，不限时、发完即继续（其他人请稍候）。\n\n"
-                      f"📋 顺序：{order_txt}"),
+                title=title,
+                desc=(roster_block(state, speeches=True, speaking_uid=player.uid)
+                      + f"\n\n🎤 轮到 **{player.seat}号** 发言（只有本人能点）；"
+                        f"点下方按钮输入，发完即继续。"),
                 color=C_DAY, view=view, footer="点『我要发言』弹出输入框",
             )
             try:
                 text = await asyncio.wait_for(fut, timeout=SPEAK)
                 if text.strip():
-                    await channel.send(f"💬 **{player.label}**：{text}")
+                    player.last_speech = text
                     day_log.append(f"{player.seat}号: {text}")
                 else:
-                    await channel.send(f"（{player.label} 选择不发言。）")
+                    player.last_speech = "（选择不发言）"
                     day_log.append(f"{player.seat}号: （沉默）")
             except asyncio.TimeoutError:
-                await channel.send(f"（{player.label} 超时，跳过发言）")
+                player.last_speech = "（超时，跳过发言）"
                 day_log.append(f"{player.seat}号: （沉默/超时）")
             finally:
                 state.current_speaker_uid = None
                 view.stop()
+            # 清掉按钮、把这位玩家的发言落在灯旁边
+            await panel.show(title=title, desc=roster_block(state, speeches=True),
+                             color=C_DAY, footer=f"按座位号轮流发言　{order_txt}")
 
 
 async def phase_vote(bot, state: GameState, panel: Panel, channel, day_log: list[str]) -> None:
@@ -921,7 +989,8 @@ async def phase_vote(bot, state: GameState, panel: Panel, channel, day_log: list
         view = VoteGateView(options, label_map, human_ids, state.host_id, votes, done, VOTE)
         await panel.show(
             title="🗳️ 第 %d 天 · 投票放逐" % state.day_count,
-            desc="存活玩家请在下方的投票面板里选择要放逐的人。",
+            desc=(roster_block(state, speeches=True)
+                  + "\n\n存活玩家请在下方的投票面板里选择要放逐的人。"),
             color=C_DAY,
         )
         vote_embed = discord.Embed(
@@ -968,7 +1037,8 @@ async def phase_vote(bot, state: GameState, panel: Panel, channel, day_log: list
         await channel.send(
             f"🔨 **{exiled.label}** 被放逐出局，身份是 {exiled.role.emoji}**{exiled.role.cn}**。")
         day_log.append(f"{exiled.seat}号 被投票放逐，身份是{exiled.role.cn}。")
-        await collect_last_words(state, panel, channel, exiled)
+        await collect_last_words(state, panel, channel, exiled,
+                                 title="🗳️ 第 %d 天 · 投票放逐" % state.day_count)
 
 
 async def announce_end(channel, panel: Panel, state: GameState) -> None:

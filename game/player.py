@@ -19,6 +19,9 @@ class Player:
     # 仅 NPC 用：性格设定，喂给 LLM 让发言有差异
     persona: str = ""
 
+    # 本轮显示在面板「灯旁边」的发言（白天发言 / 遗言）。每天天亮时清空。
+    last_speech: str = ""
+
     # 预言家的查验记录： {目标 uid: 是否为狼}
     seer_results: dict[int, bool] = field(default_factory=dict)
 
