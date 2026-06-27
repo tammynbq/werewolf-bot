@@ -46,9 +46,15 @@ _MEMORY: dict[int, str] = {}
 # 狼队当晚的统一刀法缓存：(id(state), day_count) -> uid，避免多只 NPC 狼各刀各的
 _WOLF_PLAN: dict[tuple, int | None] = {}
 
-# 通用发言规则：任何 NPC（无论人设）发言里出现外语，都要顺带给出中文意思，照顾中文玩家。
-_TRANSLATE_RULE = ("你的发言里只要出现任何非中文（英文句子、拉丁短语等），都必须顺带写出"
-                   "对应的中文意思，别让看中文的玩家看不懂。")
+# 通用发言规则：默认纯中文；只有人设本身是双语/外语背景的角色才可能蹦外语，
+# 且一旦说了外语就必须翻译。注意这不是叫每个人都说双语——纯中文人设就老老实实说中文。
+_TRANSLATE_RULE = ("默认用纯中文发言。除非你的人设明确就是双语/外语背景，否则不要夹带任何外语；"
+                   "若你的人设确实会说外语，那也只是偶尔点缀，并且每句外语后面都要紧跟中文意思，"
+                   "别让看中文的玩家看不懂。")
+# 反「上帝视角」：模型容易脑补出自己其实不知道的信息，统一钉死——只能用场上公开信息推理。
+_NO_OMNISCIENCE = ("你没有上帝视角：除了【只有你知道的秘密】里写明的内容，你并不知道任何其他人的"
+                   "真实身份或底牌，也不知道夜里发生的全部真相。只能根据公开的发言、票型和你自己的"
+                   "私密信息去推理，绝不能说得像你已经知道谁是狼/神/民——那样会立刻穿帮。")
 # 每个 NPC 本轮发言时定下的「想投谁」（uid -> 座位号），让投票跟着发言走、言行一致
 _VOTE_INTENT: dict[int, int] = {}
 
@@ -251,9 +257,11 @@ def _role_brief(player: Player, state: GameState) -> str:
             if p.role and p.role.is_wolf and p.uid != player.uid
         ]
         if mates:
-            lines.append(f"你的狼队友是：{', '.join(mates)}。务必隐藏身份，别暴露队友。")
+            lines.append(f"你的狼队友是：{', '.join(mates)}。务必隐藏身份，别暴露队友。"
+                         "除了狼队友，你并不知道其他人的真实身份（谁是预言家/女巫/平民你都不知道），"
+                         "只能靠发言和票型去猜，绝不能表现得像你已经知道。")
         else:
-            lines.append("你是独狼，要伪装成好人。")
+            lines.append("你是独狼，要伪装成好人。你不知道其他任何人的真实身份，只能靠发言和票型猜。")
     elif player.role is Role.SEER:
         lines.append(_seer_checked_text(player, state))
     elif player.role is Role.WITCH:
@@ -486,17 +494,19 @@ def _speak_strategy(player: Player) -> str:
 async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
     """让 NPC 先盘算再发言：输出 JSON {say, notes}，发言与思路一致，并更新私人笔记。"""
     secret = _role_brief(player, state)
-    log_text = "\n".join(recent_log[-14:]) if recent_log else "（第一天，暂无信息）"
+    # 多带几轮日志，方便 NPC 顺前一天的发言/票型逻辑（不止看当天）
+    log_text = "\n".join(recent_log[-24:]) if recent_log else "（第一天，暂无信息）"
 
     system = (
         "你是一名正在玩中文桌游《狼人杀》的真人玩家，绝对不是 AI，也绝不承认自己是 AI 或跳出游戏。"
         f"你是【{player.seat}号】。{_persona_clause(player)} 你的发言要带出这个人设的语气和风格。"
         f"{_speak_strategy(player)}\n"
+        f"{_NO_OMNISCIENCE}\n"
         f"{knowledge.WEREWOLF_PLAYBOOK}\n"
         "要求：\n"
         "1. 像真人在群里聊天，口语自然，有情绪、有口头禅，针对具体的人用『几号』称呼(如『我觉得3号有点跳』)。\n"
         "2. 结合你的私人笔记和场上信息，发言要有逻辑、有立场、能推动局势，别说正确的废话。\n"
-        "3. say 只 1~3 句、20~150 字（双语玩家可英文一句+中文一句，仍要简洁）。\n"
+        "3. say 只 1~3 句、20~150 字（仅人设是双语的玩家才可英文一句+中文一句，其余人纯中文）。\n"
         "4. vote 是你此刻最想投出局谁的座位号：必须和你 say 里的立场一致（说要投谁就填谁），"
         "还没想好就填 0；小心别被悍跳的狼反咬带偏。\n"
         f"5. {_TRANSLATE_RULE}\n"
@@ -550,6 +560,7 @@ async def wolf_chat(player: Player, mates: list[Player], state: GameState) -> st
         "你正在玩中文《狼人杀》，你是狼人，现在在只有狼队友能看到的私密狼人频道里商量今晚刀谁。"
         f"你是【{player.seat}号】。{_persona_clause(player)}"
         "像真人在狼队小群里聊天：简短、直接、商量口吻，可以提议刀某个具体的人、问队友意见或附和队友。"
+        "你们只知道彼此是狼，并不知道谁是预言家/女巫/平民，只能根据白天的发言去猜，别假装已经知道。"
         "只说 1~2 句、15~45 字；不要加引号、不要写名字前缀、不要 markdown、不要输出 JSON。"
         f"{_TRANSLATE_RULE}"
     )

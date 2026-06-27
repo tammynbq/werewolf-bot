@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from collections import Counter
 
 import discord
@@ -129,6 +130,15 @@ def roster_block(state: GameState, *, speeches: bool = False,
                 line += f"：{_speech_preview(p.last_speech)}"
         lines.append(line)
     return "\n".join(lines)
+
+
+def _npc_night_delay() -> float:
+    """NPC 担任神职/狼时，假装真人在『睁眼→思考→点按钮』的随机延迟（秒）。
+
+    夜晚行动如果 NPC 一律秒过（固定 2.5 秒），旁观者一眼就能看出某神职是 AI，
+    进而反推谁是真人。这里给个随机的、像真人操作时长的停顿来打掩护。
+    """
+    return random.uniform(7.0, 17.0)
 
 
 async def wait_event(event: asyncio.Event, timeout: int) -> None:
@@ -766,24 +776,19 @@ async def phase_seer(bot, state: GameState, panel: Panel) -> None:
             seer.seer_results[t] = bool(state.get(t).role.is_wolf)
 
     seer = state.alive_seer()
+    title = "🌙 第 %d 夜 · 预言家" % (state.day_count + 1)
     desc = ("🔮 **预言家请睁眼**，查验一名玩家的身份。\n其他人请闭眼等待。\n\n"
             + roster_block(state))
-    if seer is None:
-        await panel.show(title="🌙 第 %d 夜 · 预言家" % (state.day_count + 1),
-                         desc="🔮 预言家请行动……（夜色中似乎没有动静）", color=C_NIGHT)
-        await asyncio.sleep(2)
-        return
-    if seer.is_npc:
-        await panel.show(title="🌙 第 %d 夜 · 预言家" % (state.day_count + 1),
-                         desc=desc, color=C_NIGHT, footer="预言家正在行动…")
-        await asyncio.sleep(2.5)
-        return
+    # 不论预言家是真人 / AI / 甚至本局没有预言家，对外都显示同一块带按钮的面板，
+    # 旁观者看不出差别；真人就等他点按钮，AI / 空缺则用随机延迟假装真人在操作。
     done = asyncio.Event()
     view = SeerGateView(state, done, timeout=TURN)
-    await panel.show(title="🌙 第 %d 夜 · 预言家" % (state.day_count + 1),
-                     desc=desc, color=C_NIGHT, view=view,
+    await panel.show(title=title, desc=desc, color=C_NIGHT, view=view,
                      footer="预言家：点『预言家查验』行动")
-    await wait_event(done, TURN)
+    if seer is not None and not seer.is_npc:
+        await wait_event(done, TURN)
+    else:
+        await asyncio.sleep(_npc_night_delay())
     view.stop()
 
 
@@ -814,15 +819,17 @@ async def phase_wolves(bot, state: GameState, panel: Panel, channel) -> int | No
                         await thread.send(f"🐺 **{nw.label}**：{line}")
                 except discord.HTTPException:
                     pass
-        done = asyncio.Event()
-        view = WolfGateView(bot, state, votes, human_wolves, done, timeout=TURN)
-        await panel.show(title=title, desc=desc, color=C_NIGHT, view=view,
-                         footer="狼人：点『狼人行动』进入狼人频道并选刀")
+    # 对外始终显示同一块带『狼人行动』按钮的面板；有真人狼就等他点，全是 AI 狼则
+    # 用随机延迟假装真人在私频商量+选刀，旁观者看不出狼里有没有真人。
+    done = asyncio.Event()
+    view = WolfGateView(bot, state, votes, human_wolves, done, timeout=TURN)
+    await panel.show(title=title, desc=desc, color=C_NIGHT, view=view,
+                     footer="狼人：点『狼人行动』进入狼人频道并选刀")
+    if human_wolves:
         await wait_event(done, TURN)
-        view.stop()
     else:
-        await panel.show(title=title, desc=desc, color=C_NIGHT, footer="狼人正在行动…")
-        await asyncio.sleep(2.5)
+        await asyncio.sleep(_npc_night_delay())
+    view.stop()
 
     # 没投的真人狼兜底
     for w in state.alive_wolves():
@@ -847,19 +854,17 @@ async def phase_witch(bot, state: GameState, panel: Panel, kill_uid: int | None)
     victim = state.get(kill_uid) if kill_uid else None
     title = "🌙 第 %d 夜 · 女巫" % (state.day_count + 1)
 
-    if witch is None:
-        return result
-    if witch.is_npc:
+    # NPC 女巫先把救/毒决策算好（结果不对外显示，仅写进 result）
+    if witch is not None and witch.is_npc:
         heal, poison = await npc.witch_night_action(witch, state, kill_uid)
         if heal:
             witch.has_heal = False
         if poison is not None:
             witch.has_poison = False
         result["heal"], result["poison"] = heal, poison
-        await panel.show(title=title, desc="🧪 女巫请行动……", color=C_NIGHT, footer="女巫正在行动…")
-        await asyncio.sleep(2.5)
-        return result
 
+    # 不论女巫是真人 / AI / 本局无女巫，对外都显示同一块带按钮的面板；真人就等他操作，
+    # AI / 空缺则用随机延迟假装真人在用药，旁观者看不出女巫是不是 AI。
     done = asyncio.Event()
     view = WitchGateView(state, victim, result, done, timeout=TURN)
     await panel.show(
@@ -868,7 +873,10 @@ async def phase_witch(bot, state: GameState, panel: Panel, kill_uid: int | None)
               + roster_block(state)),
         color=C_NIGHT, view=view, footer="女巫：点『女巫行动』",
     )
-    await wait_event(done, TURN)
+    if witch is not None and not witch.is_npc:
+        await wait_event(done, TURN)
+    else:
+        await asyncio.sleep(_npc_night_delay())
     view.stop()
     return result
 
@@ -886,7 +894,7 @@ async def collect_last_words(state: GameState, panel: Panel, channel, player,
     fut: asyncio.Future = loop.create_future()
     state.current_speaker_uid = player.uid
     view = SpeechGateView(player, fut, btn_label="留遗言", modal_title="你的遗言",
-                          input_label="留下你的遗言（可留空）", timeout=SPEAK)
+                          input_label="留下你的遗言（可留空）", timeout=SPEAK + 120)
     await dm_user(player.uid, f"🪦 你（{player.seat}号）出局了，回到游戏面板点『留遗言』留下遗言吧。")
     await panel.ensure_bottom()
     await panel.show(
@@ -962,8 +970,10 @@ async def phase_discussion(bot, state: GameState, panel: Panel, channel, day_log
             loop = asyncio.get_running_loop()
             fut: asyncio.Future = loop.create_future()
             state.current_speaker_uid = player.uid
+            # view 的存活时间要比这一轮的等待时间长，否则玩家在输入框里打字时
+            # view 先超时、按钮失效，就会出现「说到一半按钮没了、发不出去」。
             view = SpeechGateView(player, fut, btn_label="我要发言", modal_title="你的发言",
-                                  input_label="输入你的发言", timeout=SPEAK)
+                                  input_label="输入你的发言", timeout=SPEAK + 120)
             await dm_user(player.uid, f"🎤 轮到你（{player.seat}号）发言了，回游戏面板点『我要发言』吧。")
             await panel.show(
                 title=title,
@@ -1087,6 +1097,9 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
         # 3) 昼夜循环
         day_log: list[str] = []
         while True:
+            # 每个昼夜周期都新开一块面板：上一天的面板（连同当天所有发言/票型）就留在
+            # 频道里不动，方便大家往上翻、复盘前一天的发言和投票动机。
+            panel = Panel(channel)
             await phase_seer(bot, state, panel)
             kill_uid = await phase_wolves(bot, state, panel, channel)
             witch_res = await phase_witch(bot, state, panel, kill_uid)
