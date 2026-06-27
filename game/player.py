@@ -35,6 +35,12 @@ class Player:
     # 守卫：上一晚守护的目标 uid（用于「不能连续两晚守同一人」）
     last_guard_uid: int | None = None
 
+    # 白痴：被投票放逐时免死一次（翻牌后失去投票权）
+    idiot_revealed: bool = False
+
+    # 骑士：是否已使用翻牌决斗
+    has_dueled: bool = False
+
     @property
     def mention(self) -> str:
         """在 Discord 里展示用：人类用 @提及，NPC 用名字。"""

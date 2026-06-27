@@ -154,6 +154,7 @@ class GameState:
         """votes: {投票者 uid: 目标 uid}。
 
         返回 (被放逐玩家或 None, 是否平票)。平票则无人出局。
+        白痴首次被票出时免死（翻牌），由调用方处理。
         """
         if not votes:
             return None, False
@@ -165,6 +166,10 @@ class GameState:
             return None, True  # 平票
         exiled = self.get(leaders[0])
         if exiled and exiled.alive:
+            # 白痴首次被票出：翻牌免死，但失去投票权
+            if exiled.role is Role.IDIOT and not exiled.idiot_revealed:
+                exiled.idiot_revealed = True
+                return exiled, False  # 返回但不标死，调用方处理公告
             exiled.alive = False
         return exiled, False
 

@@ -637,7 +637,7 @@ class LobbyView(discord.ui.View):
             description=(
                 f"{where}"
                 f"点击 **加入** 入座，房主点 **开始游戏** 即可开局。\n"
-                f"👥 本局人数：**{self.state.table_size} 人**（房主可点『6/12 人』切换；不足自动 AI 补位）。\n"
+                f"👥 本局人数：**{self.state.table_size} 人**（房主可点『6/8/10/12 人』切换；不足自动 AI 补位）。\n"
                 f"⚠️ 本局为**面板模式**：全程在面板上行动，平时频道里不能直接打字，"
                 f"轮到你时点面板按钮发言/行动。\n\n"
                 f"📋 {summarize_distribution(self.state.table_size, self.state.board)}"
@@ -651,7 +651,7 @@ class LobbyView(discord.ui.View):
             chosen = self.state.chosen_npc_names
             val = "、".join(chosen) if chosen else "（未指定，自动用 AI 角色补位）"
             e.add_field(name="🎭 指定 AI 角色", value=val, inline=False)
-        e.set_footer(text="房主：可调『6/12 人』『选板子』『选 AI 角色』，再点『开始游戏』开局")
+        e.set_footer(text="房主：可调『6/8/10/12 人』『选板子』『选 AI 角色』，再点『开始游戏』开局")
         return e
 
     async def refresh(self):
@@ -696,7 +696,7 @@ class LobbyView(discord.ui.View):
         await interaction.response.send_message("已退出。", ephemeral=True)
         await self.refresh()
 
-    @discord.ui.button(label="6/12 人", style=discord.ButtonStyle.secondary, emoji="👥")
+    @discord.ui.button(label="6/8/10/12 人", style=discord.ButtonStyle.secondary, emoji="👥")
     async def toggle_size(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.state.host_id:
             await interaction.response.send_message("只有房主能调整人数。", ephemeral=True)
@@ -704,8 +704,9 @@ class LobbyView(discord.ui.View):
         if self.state.phase is not Phase.LOBBY:
             await interaction.response.send_message("游戏已经开始了。", ephemeral=True)
             return
-        # 在 6 人 / 12 人之间切换
-        self.state.table_size = 12 if self.state.table_size == 6 else 6
+        sizes = [6, 8, 10, 12]
+        cur = self.state.table_size
+        self.state.table_size = sizes[(sizes.index(cur) + 1) % len(sizes)] if cur in sizes else 6
         await interaction.response.send_message(
             f"👥 本局人数已设为 **{self.state.table_size} 人**：{summarize_distribution(self.state.table_size, self.state.board)}",
             ephemeral=True,
@@ -721,7 +722,13 @@ class LobbyView(discord.ui.View):
             await interaction.response.send_message("游戏已经开始了。", ephemeral=True)
             return
         # 在各预设之间循环切换
-        order = ["auto", "simple", "hunter", "guard", "classic"]
+        order = [
+            "auto", "simple", "hunter", "guard",
+            "idiot", "knight",
+            "hunter_idiot", "hunter_knight", "guard_idiot", "guard_knight",
+            "classic", "classic_idiot", "classic_knight",
+            "wolfking", "wolfking_knight",
+        ]
         cur = self.state.board if self.state.board in order else "auto"
         self.state.board = order[(order.index(cur) + 1) % len(order)]
         await interaction.response.send_message(
@@ -1051,6 +1058,46 @@ class HunterShootGateView(discord.ui.View):
             "🏹 你是**猎人**，选择开枪带走谁：", view=view, ephemeral=True)
 
 
+class WolfKingShootSelect(discord.ui.Select):
+    def __init__(self, wolf_king, state: GameState, result: dict, done: asyncio.Event):
+        options = [discord.SelectOption(label="🚫 不带人", value="0")]
+        options += [discord.SelectOption(label=p.label, value=str(p.uid))
+                    for p in state.alive_players if p.uid != wolf_king.uid]
+        super().__init__(placeholder="选择带走的对象…", min_values=1, max_values=1, options=options)
+        self._state = state
+        self._result = result
+        self._done = done
+
+    async def callback(self, interaction: discord.Interaction):
+        uid = int(self.values[0])
+        self._result["uid"] = uid
+        self._done.set()
+        if uid == 0:
+            await interaction.response.edit_message(content="🚫 你选择不带人。", view=None)
+        else:
+            await interaction.response.edit_message(
+                content=f"👑🐺 你带走了 **{self._state.get(uid).label}**。", view=None)
+
+
+class WolfKingShootGateView(discord.ui.View):
+    def __init__(self, wolf_king, state: GameState, result: dict, done: asyncio.Event, timeout: int):
+        super().__init__(timeout=timeout)
+        self.wolf_king = wolf_king
+        self.state = state
+        self.result = result
+        self.done = done
+
+    @discord.ui.button(label="带走一人", style=discord.ButtonStyle.danger, emoji="👑")
+    async def act(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.wolf_king.uid:
+            await interaction.response.send_message("只有白狼王本人能选。", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=self.timeout)
+        view.add_item(WolfKingShootSelect(self.wolf_king, self.state, self.result, self.done))
+        await interaction.response.send_message(
+            "👑🐺 你是**白狼王**，选择带走谁：", view=view, ephemeral=True)
+
+
 async def hunter_shoot(bot, state: GameState, panel: Panel, channel, hunter, day_log: list[str]) -> None:
     """猎人出局后开枪带走一人（被女巫毒死则 can_shoot=False，不会进来）。"""
     if hunter.role is not Role.HUNTER or not hunter.can_shoot:
@@ -1089,6 +1136,43 @@ async def hunter_shoot(bot, state: GameState, panel: Panel, channel, hunter, day
     await collect_last_words(state, panel, channel, target)
 
 
+async def wolf_king_shoot(bot, state: GameState, panel: Panel, channel, wolf_king, day_log: list[str]) -> None:
+    """白狼王被投票放逐出局后可以带走一名玩家。"""
+    if wolf_king.role is not Role.WOLF_KING:
+        return
+    title = "👑🐺 白狼王带人"
+    if wolf_king.is_npc:
+        await panel.show(title=title, desc=f"👑🐺 **{wolf_king.label}** 是白狼王，正在决定带走谁……",
+                         color=C_WIN_WOLF, footer="白狼王正在选择…")
+        await asyncio.sleep(_npc_night_delay())
+        target_uid = await npc.wolf_king_shoot_target(wolf_king, state)
+    else:
+        result: dict = {"uid": None}
+        done = asyncio.Event()
+        view = WolfKingShootGateView(wolf_king, state, result, done, timeout=TURN)
+        await dm_user(wolf_king.uid, "👑🐺 你是白狼王且被放逐了，回游戏面板点按钮带走一名玩家。")
+        await panel.show(
+            title=title,
+            desc=f"👑🐺 **{wolf_king.label}** 是白狼王，被放逐了——点下方按钮带走一名玩家。",
+            color=C_WIN_WOLF, view=view, footer="白狼王：点按钮选择带走谁")
+        await wait_event(done, TURN)
+        view.stop()
+        target_uid = result["uid"]
+
+    if not target_uid:
+        await channel.send(f"👑🐺 **{wolf_king.label}**（白狼王）选择不带人。")
+        return
+    target = state.get(target_uid)
+    if target is None or not target.alive:
+        return
+    target.alive = False
+    await channel.send(
+        f"👑🐺 **{wolf_king.label}**（白狼王）带走了 **{target.label}**，"
+        f"其身份是 {target.role.emoji}**{target.role.cn}**。")
+    day_log.append(f"{wolf_king.seat}号(白狼王)带走{target.seat}号。")
+    await collect_last_words(state, panel, channel, target)
+
+
 async def announce_deaths(bot, state: GameState, panel: Panel, channel, deaths: list, day_log: list[str]) -> None:
     title = "🌅 第 %d 天 · 天亮了" % state.day_count
     # 新的一天：清掉上一轮显示在灯旁的发言，面板从干净的灯牌开始
@@ -1112,6 +1196,46 @@ async def announce_deaths(bot, state: GameState, panel: Panel, channel, deaths: 
         await hunter_shoot(bot, state, panel, channel, d, day_log)
 
 
+class KnightDuelSelect(discord.ui.Select):
+    def __init__(self, knight, state: GameState, result: dict, done: asyncio.Event):
+        options = [discord.SelectOption(label=p.label, value=str(p.uid))
+                    for p in state.alive_players if p.uid != knight.uid]
+        super().__init__(placeholder="选择决斗对象…", min_values=1, max_values=1, options=options)
+        self._state = state
+        self._result = result
+        self._done = done
+
+    async def callback(self, interaction: discord.Interaction):
+        uid = int(self.values[0])
+        self._result["uid"] = uid
+        self._done.set()
+        await interaction.response.edit_message(
+            content=f"⚔️ 你选择与 **{self._state.get(uid).label}** 决斗！", view=None)
+
+
+async def resolve_knight_duel(state: GameState, panel: Panel, channel, knight, target_uid: int, day_log: list[str]) -> bool:
+    """执行骑士决斗结算。返回 True 表示发生了决斗（讨论中断）。"""
+    knight.has_dueled = True
+    target = state.get(target_uid)
+    if target is None or not target.alive:
+        return False
+    await channel.send(
+        f"⚔️ **{knight.label}** 亮出了骑士身份牌，向 **{target.label}** 发起翻牌决斗！")
+    await asyncio.sleep(2)
+    if target.role and target.role.is_wolf:
+        target.alive = False
+        await channel.send(
+            f"⚔️ **{target.label}** 是 {target.role.emoji}**{target.role.cn}**——狼人死亡！\n"
+            f"骑士 **{knight.label}** 决斗成功！")
+        day_log.append(f"{knight.seat}号(骑士)翻牌决斗{target.seat}号，对方是{target.role.cn}，狼死。")
+    else:
+        knight.alive = False
+        await channel.send(
+            f"⚔️ **{target.label}** 不是狼人——骑士 **{knight.label}** 决斗失败，自己出局！")
+        day_log.append(f"{knight.seat}号(骑士)翻牌决斗{target.seat}号，对方不是狼，骑士自己出局。")
+    return True
+
+
 async def phase_discussion(bot, state: GameState, panel: Panel, channel, day_log: list[str]) -> None:
     title = "☀️ 第 %d 天 · 讨论" % state.day_count
     order = list(state.alive_players)
@@ -1119,9 +1243,12 @@ async def phase_discussion(bot, state: GameState, panel: Panel, channel, day_log
     # 整段讨论只靠面板就地刷新（发言显示在灯旁边、不再往下发消息），先把面板归位到
     # 频道底部，之后玩家就不用往上翻找面板了。
     await panel.ensure_bottom()
+    duel_happened = False
     for player in order:
         if not player.alive:
             continue
+        if duel_happened:
+            break
         if player.is_npc:
             state.current_speaker_uid = None
             # 该 NPC 这格先标「发言中…」，其余人保留各自已说的话
@@ -1130,6 +1257,14 @@ async def phase_discussion(bot, state: GameState, panel: Panel, channel, day_log
                 desc=roster_block(state, speeches=True, speaking_uid=player.uid),
                 color=C_DAY, footer=f"按座位号轮流发言　{order_txt}",
             )
+            # NPC 骑士：发言前先判断是否发起决斗
+            if (player.role is Role.KNIGHT and not player.has_dueled):
+                duel_target = await npc.knight_duel_decision(player, state, day_log)
+                if duel_target is not None:
+                    duel_happened = await resolve_knight_duel(
+                        state, panel, channel, player, duel_target, day_log)
+                    if duel_happened:
+                        break
             # 先生成发言，再按字数模拟「真人打字」的停顿，避免 NPC 秒回暴露身份
             async with channel.typing():
                 try:
@@ -1157,6 +1292,23 @@ async def phase_discussion(bot, state: GameState, panel: Panel, channel, day_log
             # view 先超时、按钮失效，就会出现「说到一半按钮没了、发不出去」。
             view = SpeechGateView(player, fut, btn_label="我要发言", modal_title="你的发言",
                                   input_label="输入你的发言", timeout=SPEAK + 120)
+            # 骑士未决斗过：额外加一个「翻牌决斗」按钮
+            duel_result: dict = {"uid": None}
+            duel_done = asyncio.Event()
+            is_knight = (player.role is Role.KNIGHT and not player.has_dueled)
+            if is_knight:
+                duel_btn = discord.ui.Button(label="翻牌决斗", style=discord.ButtonStyle.danger, emoji="⚔️")
+                async def _duel_cb(interaction: discord.Interaction, _btn=duel_btn):
+                    if interaction.user.id != player.uid:
+                        await interaction.response.send_message("只有骑士本人能发起决斗。", ephemeral=True)
+                        return
+                    dv = discord.ui.View(timeout=SPEAK)
+                    dv.add_item(KnightDuelSelect(player, state, duel_result, duel_done))
+                    await interaction.response.send_message(
+                        "⚔️ 你是**骑士**，选择决斗对象（对方是狼则狼死，否则你死）：",
+                        view=dv, ephemeral=True)
+                duel_btn.callback = _duel_cb
+                view.add_item(duel_btn)
             await dm_user(player.uid, f"🎤 轮到你（{player.seat}号）发言了，回游戏面板点『我要发言』吧。")
             await panel.show(
                 title=title,
@@ -1165,20 +1317,35 @@ async def phase_discussion(bot, state: GameState, panel: Panel, channel, day_log
                         f"点下方按钮输入，发完即继续。"),
                 color=C_DAY, view=view, footer="点『我要发言』弹出输入框",
             )
-            try:
-                text = await asyncio.wait_for(fut, timeout=SPEAK)
-                if text.strip():
-                    player.last_speech = text
-                    day_log.append(f"{player.seat}号: {text}")
-                else:
-                    player.last_speech = "（选择不发言）"
-                    day_log.append(f"{player.seat}号: （沉默）")
-            except asyncio.TimeoutError:
-                player.last_speech = "（超时，跳过发言）"
-                day_log.append(f"{player.seat}号: （沉默/超时）")
-            finally:
-                state.current_speaker_uid = None
-                view.stop()
+            # 等待发言或决斗（先到先得）
+            speech_task = asyncio.create_task(asyncio.wait_for(fut, timeout=SPEAK))
+            duel_task = asyncio.create_task(duel_done.wait()) if is_knight else None
+            tasks = [speech_task]
+            if duel_task:
+                tasks.append(duel_task)
+            done_set, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+            state.current_speaker_uid = None
+            view.stop()
+
+            if duel_task in done_set and duel_result["uid"]:
+                duel_happened = await resolve_knight_duel(
+                    state, panel, channel, player, duel_result["uid"], day_log)
+                if duel_happened:
+                    break
+            else:
+                try:
+                    text = speech_task.result()
+                    if text and text.strip():
+                        player.last_speech = text
+                        day_log.append(f"{player.seat}号: {text}")
+                    else:
+                        player.last_speech = "（选择不发言）"
+                        day_log.append(f"{player.seat}号: （沉默）")
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    player.last_speech = "（超时，跳过发言）"
+                    day_log.append(f"{player.seat}号: （沉默/超时）")
             # 清掉按钮、把这位玩家的发言落在灯旁边
             await panel.show(title=title, desc=roster_block(state, speeches=True),
                              color=C_DAY, footer=f"按座位号轮流发言　{order_txt}")
@@ -1186,8 +1353,10 @@ async def phase_discussion(bot, state: GameState, panel: Panel, channel, day_log
 
 async def phase_vote(bot, state: GameState, panel: Panel, channel, day_log: list[str]) -> None:
     alive = list(state.alive_players)
+    # 白痴翻牌后失去投票权
+    voters = [p for p in alive if not p.idiot_revealed]
     options = [("🙅 弃权（不投票）", "0")] + [(p.label, str(p.uid)) for p in alive]
-    human_ids = {p.uid for p in alive if not p.is_npc}
+    human_ids = {p.uid for p in voters if not p.is_npc}
 
     # value(uid) -> 展示名，给确认提示用
     label_map = {p.uid: p.label for p in alive}
@@ -1216,7 +1385,7 @@ async def phase_vote(bot, state: GameState, panel: Panel, channel, day_log: list
         except discord.HTTPException:
             pass
 
-    for p in alive:
+    for p in voters:
         if p.is_npc:
             t = await npc.vote_decision(p, state, day_log)
             if t is not None:
@@ -1242,6 +1411,12 @@ async def phase_vote(bot, state: GameState, panel: Panel, channel, day_log: list
     elif tie or exiled is None:
         await channel.send("⚖️ 平票，本轮无人被放逐。")
         day_log.append("投票平票，无人出局。")
+    elif exiled.role is Role.IDIOT and exiled.alive:
+        # 白痴翻牌免死（resolve_votes 里没标死，alive 仍为 True）
+        await channel.send(
+            f"🤡 **{exiled.label}** 被投票放逐——但翻出了身份牌 {exiled.role.emoji}**{exiled.role.cn}**！\n"
+            f"白痴免死一次，但从此失去投票权。")
+        day_log.append(f"{exiled.seat}号 被投票放逐，翻牌白痴免死（失去投票权）。")
     else:
         await channel.send(
             f"🔨 **{exiled.label}** 被放逐出局，身份是 {exiled.role.emoji}**{exiled.role.cn}**。")
@@ -1250,6 +1425,8 @@ async def phase_vote(bot, state: GameState, panel: Panel, channel, day_log: list
                                  title="🗳️ 第 %d 天 · 投票放逐" % state.day_count)
         # 猎人被票出可开枪带走一人
         await hunter_shoot(bot, state, panel, channel, exiled, day_log)
+        # 白狼王被票出可带走一人
+        await wolf_king_shoot(bot, state, panel, channel, exiled, day_log)
 
 
 async def announce_end(channel, panel: Panel, state: GameState) -> None:

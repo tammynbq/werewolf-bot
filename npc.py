@@ -282,6 +282,26 @@ def _role_brief(player: Player, state: GameState) -> str:
     elif player.role is Role.HUNTER:
         lines.append("你是好人阵营的猎人，出局时（被狼刀或被票出）能开枪带走一人，"
                      "但被女巫毒死则不能开枪。可以适时亮身份威慑狼，也可以隐藏。")
+    elif player.role is Role.IDIOT:
+        extra = "你已经翻牌了，不能再投票，但仍可发言分析帮好人。" if player.idiot_revealed else \
+                "你是好人阵营的白痴，被投票放逐时会自动翻牌免死一次（但之后失去投票权）。低调找狼就行，不怕被票。"
+        lines.append(extra)
+    elif player.role is Role.KNIGHT:
+        if player.has_dueled:
+            lines.append("你是好人阵营的骑士，但决斗机会已经用过了。靠逻辑找狼吧。")
+        else:
+            lines.append("你是好人阵营的骑士，白天可以亮牌与一名玩家翻牌决斗："
+                         "对方是狼则狼死，对方不是狼则你自己死。一局只能用一次，要看准再用。")
+    elif player.role is Role.WOLF_KING:
+        mates = [
+            f"{p.seat}号" for p in state.players
+            if p.role and p.role.is_wolf and p.uid != player.uid
+        ]
+        if mates:
+            lines.append(f"你是白狼王（狼人阵营），狼队友是：{', '.join(mates)}。"
+                         "被投票放逐出局时可以带走一名玩家。务必隐藏身份，别暴露队友。")
+        else:
+            lines.append("你是白狼王（狼人阵营），独狼。被投票放逐出局时可以带走一名玩家。要伪装成好人。")
     return " ".join(lines)
 
 
@@ -406,6 +426,39 @@ async def hunter_shoot_target(hunter: Player, state: GameState) -> int | None:
     others = [p for p in state.alive_players if p.uid != hunter.uid]
     if not others:
         return None
+    return random.choice(others).uid
+
+
+# ============================================================
+# 骑士翻牌决斗（轻量规则，不花 API）
+# ============================================================
+async def knight_duel_decision(knight: Player, state: GameState, day_log: list[str]) -> int | None:
+    """骑士是否发起决斗：有被预言家报验的狼且存活就决斗，否则不发动。返回目标 uid 或 None。"""
+    if knight.has_dueled:
+        return None
+    reported_wolf = _scan_seer_report(state, day_log)
+    if reported_wolf is not None:
+        target = state.get(reported_wolf)
+        if target and target.alive and target.uid != knight.uid:
+            return target.uid
+    return None
+
+
+# ============================================================
+# 出局 · 白狼王带人（轻量规则，不花 API）
+# ============================================================
+async def wolf_king_shoot_target(wolf_king: Player, state: GameState) -> int | None:
+    """白狼王被票出时带走谁：优先带预言家/女巫等神职，否则随机带一个好人。"""
+    others = [p for p in state.alive_players if p.uid != wolf_king.uid]
+    if not others:
+        return None
+    gods = [p for p in others if p.role and not p.role.is_wolf
+            and p.role not in (Role.VILLAGER,)]
+    if gods:
+        return random.choice(gods).uid
+    good = [p for p in others if p.role and not p.role.is_wolf]
+    if good:
+        return random.choice(good).uid
     return random.choice(others).uid
 
 
@@ -541,6 +594,20 @@ def _speak_strategy(player: Player) -> str:
     if player.role is Role.HUNTER:
         return ("你是猎人：靠逻辑找狼，可适时亮身份用『我出局会开枪』威慑狼，也可以隐藏；"
                 "有可信预言家报验狼时号召一起投。")
+    if player.role is Role.IDIOT:
+        if player.idiot_revealed:
+            return ("你已翻牌白痴，不能投票了，但仍可发言帮好人分析；"
+                    "大胆说出你的判断，帮好人理清逻辑。")
+        return ("你是白痴：不怕被票（被票出自动翻牌免死），所以可以大胆发言、甚至故意引票试探；"
+                "但别暴露身份，让狼以为票你能赚。")
+    if player.role is Role.KNIGHT:
+        if player.has_dueled:
+            return "你是骑士但决斗已用完，靠逻辑找狼、投票抓狼。"
+        return ("你是骑士：有一次翻牌决斗机会（对方是狼则狼死，不是狼你死），"
+                "看准了再用；没把握就先靠逻辑找狼。")
+    if player.role is Role.WOLF_KING:
+        return ("你是白狼王：伪装成好人，适度怀疑别人、保护狼队友；"
+                "被票出时你能带走一人，这是你的底牌。")
     return ("你是平民：靠逻辑找狼，多分析别人的发言和票型，推动好人抓狼。"
             "若有人跳预言家报验了某人是狼且没人对跳，就明确表态跟他、号召一起投那个狼。")
 
