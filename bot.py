@@ -23,7 +23,7 @@ import config
 import llm
 import npc
 from characters import CHARACTER_NPCS
-from game.roles import Role, summarize_distribution
+from game.roles import BOARD_NAMES, Role, summarize_distribution
 from game.state import GameState, Phase, Team
 
 logging.basicConfig(
@@ -640,7 +640,7 @@ class LobbyView(discord.ui.View):
                 f"👥 本局人数：**{self.state.table_size} 人**（房主可点『6/12 人』切换；不足自动 AI 补位）。\n"
                 f"⚠️ 本局为**面板模式**：全程在面板上行动，平时频道里不能直接打字，"
                 f"轮到你时点面板按钮发言/行动。\n\n"
-                f"📋 {summarize_distribution(self.state.table_size, config.BOARD)}"
+                f"📋 {summarize_distribution(self.state.table_size, self.state.board)}"
             ),
             color=C_INFO,
         )
@@ -651,7 +651,7 @@ class LobbyView(discord.ui.View):
             chosen = self.state.chosen_npc_names
             val = "、".join(chosen) if chosen else "（未指定，自动用 AI 角色补位）"
             e.add_field(name="🎭 指定 AI 角色", value=val, inline=False)
-        e.set_footer(text="房主：可『选 AI 角色』，再点『开始游戏』开局")
+        e.set_footer(text="房主：可调『6/12 人』『选板子』『选 AI 角色』，再点『开始游戏』开局")
         return e
 
     async def refresh(self):
@@ -707,7 +707,26 @@ class LobbyView(discord.ui.View):
         # 在 6 人 / 12 人之间切换
         self.state.table_size = 12 if self.state.table_size == 6 else 6
         await interaction.response.send_message(
-            f"👥 本局人数已设为 **{self.state.table_size} 人**：{summarize_distribution(self.state.table_size, config.BOARD)}",
+            f"👥 本局人数已设为 **{self.state.table_size} 人**：{summarize_distribution(self.state.table_size, self.state.board)}",
+            ephemeral=True,
+        )
+        await self.refresh()
+
+    @discord.ui.button(label="选板子", style=discord.ButtonStyle.secondary, emoji="🎲")
+    async def cycle_board(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.state.host_id:
+            await interaction.response.send_message("只有房主能切换板子。", ephemeral=True)
+            return
+        if self.state.phase is not Phase.LOBBY:
+            await interaction.response.send_message("游戏已经开始了。", ephemeral=True)
+            return
+        # 在各预设之间循环切换
+        order = ["auto", "simple", "hunter", "guard", "classic"]
+        cur = self.state.board if self.state.board in order else "auto"
+        self.state.board = order[(order.index(cur) + 1) % len(order)]
+        await interaction.response.send_message(
+            f"🎲 本局板子已设为 **{BOARD_NAMES.get(self.state.board, self.state.board)}**：\n"
+            f"{summarize_distribution(self.state.table_size, self.state.board)}",
             ephemeral=True,
         )
         await self.refresh()
@@ -1251,7 +1270,7 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
             return
 
         # 2) 分配角色（按配置的板子预设）
-        state.assign_roles(config.BOARD)
+        state.assign_roles(state.board)
         await phase_reveal(state, panel)
 
         # 3) 昼夜循环（守卫 → 预言家 → 狼人 → 女巫）
@@ -1325,6 +1344,7 @@ async def new_game(interaction: discord.Interaction):
             ephemeral=True)
         return
     state = GameState(channel_id=cid, host_id=interaction.user.id)
+    state.board = config.BOARD  # 环境变量作为默认板子，房主可在大厅按钮临时改
     state.add_human(interaction.user.id, interaction.user.display_name)
     games[cid] = state
 

@@ -44,6 +44,8 @@ class GameState:
         self.chosen_npc_names: list[str] = []
         # 本局桌子人数（房主在大厅选 6 / 12；不足用 AI 补位）
         self.table_size: int = 6
+        # 本局板子预设（房主在大厅选；见 roles._PRESETS）。默认 auto，建局时由环境变量覆盖。
+        self.board: str = "auto"
 
     # ---------- 玩家管理 ----------
     def get(self, uid: int) -> Player | None:
