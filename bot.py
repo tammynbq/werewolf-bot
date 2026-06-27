@@ -599,7 +599,8 @@ class NpcPickSelect(discord.ui.Select):
         opts = [
             discord.SelectOption(
                 label=c.name, value=c.name,
-                description=(c.persona.strip().splitlines()[0][:90] if c.persona else None),
+                # 只显示对外简介，别把 persona（完整人设/打法）漏给房主，免得提前摸清这名 AI
+                description=((c.intro or "").strip()[:100] or None),
                 default=(c.name in state.chosen_npc_names),
             )
             for c in CHARACTER_NPCS
