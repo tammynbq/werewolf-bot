@@ -1484,6 +1484,36 @@ async def on_message(message: discord.Message):
         pass
 
 
+@client.event
+async def on_interaction(interaction: discord.Interaction):
+    """兜底「孤儿按钮」：bot 重新部署 / 重启后，内存里的对局（games 字典 + 跑 run_game
+    的协程 + 注册的 View）全没了，旧面板上的按钮再点就只会「交互失败」，整局看起来卡死。
+
+    这里只拦**没有任何在内存里的对局认领**的组件交互（即重启后残留的旧面板），给玩家一个
+    明确提示去重开；仍在进行中的对局有对应 View 处理，这里不插手（直接 return）。
+    slash 命令（application_command）也不归这里管。
+    """
+    if interaction.type is not discord.InteractionType.component:
+        return
+    cid = interaction.channel_id
+    # 只要还有哪一局在内存里引用了这个频道（主频道 / 游戏线程 / 狼人线程），就交给它的 View
+    alive = any(
+        cid in (s.channel_id, s.play_channel_id, s.thread_id, s.wolf_thread_id)
+        for s in games.values()
+    )
+    if alive:
+        return
+    try:
+        await interaction.response.send_message(
+            "⚠️ 这一局已经失效了——bot 可能重启或重新部署过，**进行中的对局不会被保留**。\n"
+            "请用 `/werewolf new` 重新开一局。",
+            ephemeral=True,
+        )
+    except discord.HTTPException:
+        # 交互已被别处响应 / 已过期，忽略即可
+        pass
+
+
 def run() -> None:
     missing = config.validate()
     if missing:
