@@ -580,10 +580,10 @@ class LobbyView(discord.ui.View):
             description=(
                 f"{where}"
                 f"点击 **加入** 入座，房主点 **开始游戏** 即可开局。\n"
-                f"人数不足会自动用 🤖AI NPC 补位到 **{config.TOTAL_PLAYERS}** 人。\n"
+                f"👥 本局人数：**{self.state.table_size} 人**（房主可点『6/12 人』切换；不足自动 AI 补位）。\n"
                 f"⚠️ 本局为**面板模式**：全程在面板上行动，平时频道里不能直接打字，"
                 f"轮到你时点面板按钮发言/行动。\n\n"
-                f"📋 {summarize_distribution(config.TOTAL_PLAYERS)}"
+                f"📋 {summarize_distribution(self.state.table_size)}"
             ),
             color=C_INFO,
         )
@@ -637,6 +637,22 @@ class LobbyView(discord.ui.View):
             except discord.HTTPException:
                 pass
         await interaction.response.send_message("已退出。", ephemeral=True)
+        await self.refresh()
+
+    @discord.ui.button(label="6/12 人", style=discord.ButtonStyle.secondary, emoji="👥")
+    async def toggle_size(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.state.host_id:
+            await interaction.response.send_message("只有房主能调整人数。", ephemeral=True)
+            return
+        if self.state.phase is not Phase.LOBBY:
+            await interaction.response.send_message("游戏已经开始了。", ephemeral=True)
+            return
+        # 在 6 人 / 12 人之间切换
+        self.state.table_size = 12 if self.state.table_size == 6 else 6
+        await interaction.response.send_message(
+            f"👥 本局人数已设为 **{self.state.table_size} 人**：{summarize_distribution(self.state.table_size)}",
+            ephemeral=True,
+        )
         await self.refresh()
 
     @discord.ui.button(label="选 AI 角色", style=discord.ButtonStyle.secondary, emoji="🎭")
@@ -1053,8 +1069,8 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
     state.play_channel_id = channel.id
     panel = Panel(channel)
     try:
-        # 1) NPC 补位
-        target = max(config.TOTAL_PLAYERS, len(state.humans))
+        # 1) NPC 补位（补到房主选的桌子人数；真人比这还多则以真人数为准）
+        target = max(state.table_size, len(state.humans))
         need = target - len(state.players)
         if need > 0:
             existing = {p.name for p in state.players}
