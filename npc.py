@@ -562,7 +562,8 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
         f"现在是第 {state.day_count} 天白天，大家按座位号轮流发言。\n"
         f"本局存活玩家：{_alive_roster(state)}。\n"
         f"目前为止的场上发言与信息：\n{log_text}\n\n"
-        f"轮到你（{player.seat}号）了，先想再说，输出 JSON："
+        f"轮到你（{player.seat}号）了，快速判断、别钻牛角尖：想清楚立场就直接给出 say，"
+        f"notes 也只写要点、别长篇推理。直接输出 JSON："
     )
 
     # 先清掉上一轮的投票意向；这次发言解析成功才会重新定下，避免兜底沉默时残留旧意向

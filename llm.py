@@ -137,14 +137,19 @@ async def chat(
         await _throttle()  # 先过全局限速闸，避免和其他 NPC 调用挤在一起触发限流
         hit_rate_limit = False
         try:
-            resp = await _get_client().chat.completions.create(
-                model=config.MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=config.NPC_TEMPERATURE if temperature is None else temperature,
-                max_tokens=effective_max,
+            # 用 asyncio.wait_for 再套一层硬时限：思考型模型 + 慢中转站常常不认 SDK 的
+            # timeout、能拖很久，这里强制每次调用不超过 LLM_TIMEOUT_SECONDS，超了当失败重试。
+            resp = await asyncio.wait_for(
+                _get_client().chat.completions.create(
+                    model=config.MODEL_NAME,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    temperature=config.NPC_TEMPERATURE if temperature is None else temperature,
+                    max_tokens=effective_max,
+                ),
+                timeout=config.LLM_TIMEOUT_SECONDS,
             )
             content, finish = _extract_content(resp)
             if content:

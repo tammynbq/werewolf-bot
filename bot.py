@@ -1132,7 +1132,13 @@ async def phase_discussion(bot, state: GameState, panel: Panel, channel, day_log
             )
             # 先生成发言，再按字数模拟「真人打字」的停顿，避免 NPC 秒回暴露身份
             async with channel.typing():
-                speech = await npc.speak(player, state, day_log)
+                try:
+                    # 硬时限：NPC 想太久/卡住就当本轮沉默，游戏继续，绝不「发言中」卡死
+                    speech = await asyncio.wait_for(
+                        npc.speak(player, state, day_log),
+                        timeout=config.NPC_THINK_SECONDS)
+                except asyncio.TimeoutError:
+                    speech = ""
                 await asyncio.sleep(min(9.0, 1.5 + len(speech) * 0.12))
             if speech:
                 player.last_speech = speech
