@@ -29,6 +29,12 @@ class Player:
     has_heal: bool = True
     has_poison: bool = True
 
+    # 猎人：出局时能否开枪（被女巫毒死则不能；开过枪后置 False）
+    can_shoot: bool = True
+
+    # 守卫：上一晚守护的目标 uid（用于「不能连续两晚守同一人」）
+    last_guard_uid: int | None = None
+
     @property
     def mention(self) -> str:
         """在 Discord 里展示用：人类用 @提及，NPC 用名字。"""

@@ -255,6 +255,53 @@ class SeerGateView(discord.ui.View):
 
 
 # ============================================================
+# 夜晚 · 守卫
+# ============================================================
+class GuardProtectSelect(discord.ui.Select):
+    def __init__(self, guard, state: GameState, result: dict, done: asyncio.Event):
+        options = []
+        for p in state.alive_players:
+            if p.uid == guard.last_guard_uid:
+                continue  # 不能连续两晚守同一人
+            label = f"{p.label}（🛡️守自己）" if p.uid == guard.uid else p.label
+            options.append(discord.SelectOption(label=label, value=str(p.uid)))
+        super().__init__(placeholder="选择今晚守护的对象…", min_values=1, max_values=1, options=options)
+        self._guard = guard
+        self._state = state
+        self._result = result
+        self._done = done
+
+    async def callback(self, interaction: discord.Interaction):
+        uid = int(self.values[0])
+        self._result["uid"] = uid
+        target = self._state.get(uid)
+        self._done.set()
+        await interaction.response.edit_message(
+            content=f"🛡️ 今晚你守护了 **{target.label}**。", view=None)
+
+
+class GuardGateView(discord.ui.View):
+    def __init__(self, state: GameState, result: dict, done: asyncio.Event, timeout: int):
+        super().__init__(timeout=timeout)
+        self.state = state
+        self.result = result
+        self.done = done
+
+    @discord.ui.button(label="守卫行动", style=discord.ButtonStyle.primary, emoji="🛡️")
+    async def act(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guard = self.state.alive_guard()
+        if guard is None or guard.uid != interaction.user.id:
+            await interaction.response.send_message(
+                "🌙 天黑了，请闭眼等待守卫行动。", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=self.timeout)
+        view.add_item(GuardProtectSelect(guard, self.state, self.result, self.done))
+        await interaction.response.send_message(
+            "🛡️ 你是**守卫**，选择今晚守护的对象（不能连守同一人，可守自己）：",
+            view=view, ephemeral=True)
+
+
+# ============================================================
 # 夜晚 · 狼人
 # ============================================================
 class WolfKillSelect(discord.ui.Select):
@@ -593,7 +640,7 @@ class LobbyView(discord.ui.View):
                 f"👥 本局人数：**{self.state.table_size} 人**（房主可点『6/12 人』切换；不足自动 AI 补位）。\n"
                 f"⚠️ 本局为**面板模式**：全程在面板上行动，平时频道里不能直接打字，"
                 f"轮到你时点面板按钮发言/行动。\n\n"
-                f"📋 {summarize_distribution(self.state.table_size)}"
+                f"📋 {summarize_distribution(self.state.table_size, config.BOARD)}"
             ),
             color=C_INFO,
         )
@@ -660,7 +707,7 @@ class LobbyView(discord.ui.View):
         # 在 6 人 / 12 人之间切换
         self.state.table_size = 12 if self.state.table_size == 6 else 6
         await interaction.response.send_message(
-            f"👥 本局人数已设为 **{self.state.table_size} 人**：{summarize_distribution(self.state.table_size)}",
+            f"👥 本局人数已设为 **{self.state.table_size} 人**：{summarize_distribution(self.state.table_size, config.BOARD)}",
             ephemeral=True,
         )
         await self.refresh()
@@ -766,6 +813,34 @@ async def phase_reveal(state: GameState, panel: Panel) -> None:
     )
     await wait_event(done, REVEAL_SECONDS + 30)
     view.stop()
+
+
+async def phase_guard(bot, state: GameState, panel: Panel) -> int | None:
+    """守卫夜晚，返回今晚守护目标 uid（None = 没守 / 本局没有守卫）。
+
+    与预言家同款拟真：不论守卫是真人 / AI / 本局没有，对外都显示同一块带按钮的面板，
+    真人就等他点，AI / 空缺用随机延迟假装真人在操作，旁观者看不出差别。
+    """
+    guard = state.alive_guard()
+    title = "🌙 第 %d 夜 · 守卫" % (state.day_count + 1)
+    desc = ("🛡️ **守卫请睁眼**，守护一名玩家使其今晚不被狼刀。\n其他人请闭眼等待。\n\n"
+            + roster_block(state))
+    result: dict = {"uid": None}
+    done = asyncio.Event()
+    view = GuardGateView(state, result, done, timeout=TURN)
+    await panel.show(title=title, desc=desc, color=C_NIGHT, view=view, footer="守卫：点『守卫行动』")
+    guard_uid = None
+    if guard is not None and not guard.is_npc:
+        await wait_event(done, TURN)
+        guard_uid = result["uid"]
+    else:
+        await asyncio.sleep(_npc_night_delay())
+        if guard is not None:  # NPC 守卫：随机延迟后按规则选守护目标
+            guard_uid = await npc.guard_target(guard, state)
+    view.stop()
+    if guard is not None:
+        guard.last_guard_uid = guard_uid
+    return guard_uid
 
 
 async def phase_seer(bot, state: GameState, panel: Panel) -> None:
@@ -914,7 +989,88 @@ async def collect_last_words(state: GameState, panel: Panel, channel, player,
     await panel.show(title=title, desc=roster_block(state, speeches=True), color=C_DAY)
 
 
-async def announce_deaths(state: GameState, panel: Panel, channel, deaths: list, day_log: list[str]) -> None:
+# ============================================================
+# 猎人开枪
+# ============================================================
+class HunterShootSelect(discord.ui.Select):
+    def __init__(self, hunter, state: GameState, result: dict, done: asyncio.Event):
+        options = [discord.SelectOption(label="🚫 不开枪", value="0")]
+        options += [discord.SelectOption(label=p.label, value=str(p.uid))
+                    for p in state.alive_players if p.uid != hunter.uid]
+        super().__init__(placeholder="选择开枪带走的对象…", min_values=1, max_values=1, options=options)
+        self._state = state
+        self._result = result
+        self._done = done
+
+    async def callback(self, interaction: discord.Interaction):
+        uid = int(self.values[0])
+        self._result["uid"] = uid
+        self._done.set()
+        if uid == 0:
+            await interaction.response.edit_message(content="🚫 你选择不开枪。", view=None)
+        else:
+            await interaction.response.edit_message(
+                content=f"🏹 你开枪带走了 **{self._state.get(uid).label}**。", view=None)
+
+
+class HunterShootGateView(discord.ui.View):
+    def __init__(self, hunter, state: GameState, result: dict, done: asyncio.Event, timeout: int):
+        super().__init__(timeout=timeout)
+        self.hunter = hunter
+        self.state = state
+        self.result = result
+        self.done = done
+
+    @discord.ui.button(label="开枪", style=discord.ButtonStyle.danger, emoji="🏹")
+    async def act(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.hunter.uid:
+            await interaction.response.send_message("只有猎人本人能开枪。", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=self.timeout)
+        view.add_item(HunterShootSelect(self.hunter, self.state, self.result, self.done))
+        await interaction.response.send_message(
+            "🏹 你是**猎人**，选择开枪带走谁：", view=view, ephemeral=True)
+
+
+async def hunter_shoot(bot, state: GameState, panel: Panel, channel, hunter, day_log: list[str]) -> None:
+    """猎人出局后开枪带走一人（被女巫毒死则 can_shoot=False，不会进来）。"""
+    if hunter.role is not Role.HUNTER or not hunter.can_shoot:
+        return
+    hunter.can_shoot = False  # 一次性
+    title = "🏹 猎人开枪"
+    if hunter.is_npc:
+        await panel.show(title=title, desc=f"🏹 **{hunter.label}** 是猎人，正在决定开枪带走谁……",
+                         color=C_WIN_WOLF, footer="猎人正在开枪…")
+        await asyncio.sleep(_npc_night_delay())  # 假装真人在犹豫开枪
+        target_uid = await npc.hunter_shoot_target(hunter, state)
+    else:
+        result: dict = {"uid": None}
+        done = asyncio.Event()
+        view = HunterShootGateView(hunter, state, result, done, timeout=TURN)
+        await dm_user(hunter.uid, "🏹 你是猎人且出局了，回游戏面板点『开枪』带走一人。")
+        await panel.show(
+            title=title,
+            desc=f"🏹 **{hunter.label}** 是猎人，出局了——点下方按钮开枪带走一名玩家。",
+            color=C_WIN_WOLF, view=view, footer="猎人：点『开枪』")
+        await wait_event(done, TURN)
+        view.stop()
+        target_uid = result["uid"]
+
+    if not target_uid:
+        await channel.send(f"🏹 **{hunter.label}**（猎人）没有开枪。")
+        return
+    target = state.get(target_uid)
+    if target is None or not target.alive:
+        return
+    target.alive = False
+    await channel.send(
+        f"🏹 **{hunter.label}**（猎人）开枪带走了 **{target.label}**，"
+        f"其身份是 {target.role.emoji}**{target.role.cn}**。")
+    day_log.append(f"{hunter.seat}号(猎人)开枪带走{target.seat}号。")
+    await collect_last_words(state, panel, channel, target)
+
+
+async def announce_deaths(bot, state: GameState, panel: Panel, channel, deaths: list, day_log: list[str]) -> None:
     title = "🌅 第 %d 天 · 天亮了" % state.day_count
     # 新的一天：清掉上一轮显示在灯旁的发言，面板从干净的灯牌开始
     for p in state.players:
@@ -933,6 +1089,8 @@ async def announce_deaths(state: GameState, panel: Panel, channel, deaths: list,
     await asyncio.sleep(1.5)
     for d in deaths:
         await collect_last_words(state, panel, channel, d, title=title)
+        # 猎人被狼刀出局可开枪（被女巫毒死时 can_shoot 已为 False）
+        await hunter_shoot(bot, state, panel, channel, d, day_log)
 
 
 async def phase_discussion(bot, state: GameState, panel: Panel, channel, day_log: list[str]) -> None:
@@ -1065,6 +1223,8 @@ async def phase_vote(bot, state: GameState, panel: Panel, channel, day_log: list
         day_log.append(f"{exiled.seat}号 被投票放逐，身份是{exiled.role.cn}。")
         await collect_last_words(state, panel, channel, exiled,
                                  title="🗳️ 第 %d 天 · 投票放逐" % state.day_count)
+        # 猎人被票出可开枪带走一人
+        await hunter_shoot(bot, state, panel, channel, exiled, day_log)
 
 
 async def announce_end(channel, panel: Panel, state: GameState) -> None:
@@ -1090,22 +1250,24 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
             await channel.send("⚠️ 人数不足（至少 3 人），游戏取消。")
             return
 
-        # 2) 分配角色
-        state.assign_roles()
+        # 2) 分配角色（按配置的板子预设）
+        state.assign_roles(config.BOARD)
         await phase_reveal(state, panel)
 
-        # 3) 昼夜循环
+        # 3) 昼夜循环（守卫 → 预言家 → 狼人 → 女巫）
         day_log: list[str] = []
         while True:
             # 每个昼夜周期都新开一块面板：上一天的面板（连同当天所有发言/票型）就留在
             # 频道里不动，方便大家往上翻、复盘前一天的发言和投票动机。
             panel = Panel(channel)
+            guard_uid = await phase_guard(bot, state, panel)
             await phase_seer(bot, state, panel)
             kill_uid = await phase_wolves(bot, state, panel, channel)
             witch_res = await phase_witch(bot, state, panel, kill_uid)
-            deaths = state.resolve_night(kill_uid, witch_res["heal"], witch_res["poison"])
+            deaths = state.resolve_night(
+                kill_uid, witch_res["heal"], witch_res["poison"], guard_uid)
 
-            await announce_deaths(state, panel, channel, deaths, day_log)
+            await announce_deaths(bot, state, panel, channel, deaths, day_log)
             if state.check_winner():
                 break
 

@@ -269,6 +269,12 @@ def _role_brief(player: Player, state: GameState) -> str:
         potions.append("解药" + ("还在" if player.has_heal else "已用"))
         potions.append("毒药" + ("还在" if player.has_poison else "已用"))
         lines.append("你是好人阵营，" + "、".join(potions) + "。注意别暴露女巫身份被狼针对。")
+    elif player.role is Role.GUARD:
+        lines.append("你是好人阵营的守卫，每晚守护一人免遭狼刀（不能连守同一人，可守自己）；"
+                     "注意『同守同救』会让被守的人照样死。别轻易暴露身份被狼针对。")
+    elif player.role is Role.HUNTER:
+        lines.append("你是好人阵营的猎人，出局时（被狼刀或被票出）能开枪带走一人，"
+                     "但被女巫毒死则不能开枪。可以适时亮身份威慑狼，也可以隐藏。")
     return " ".join(lines)
 
 
@@ -363,6 +369,37 @@ def _suspect_from_notes(voter: Player, state: GameState, exclude: set[int] = fro
 async def seer_check_target(seer: Player, state: GameState) -> int | None:
     # 决策走规则省调用；预言家「会不会报验带队」由白天的 LLM 发言体现。
     return _rule_seer_check(seer, state)
+
+
+# ============================================================
+# 夜晚 · 守卫守护（轻量规则，不花 API）
+# ============================================================
+async def guard_target(guard: Player, state: GameState) -> int | None:
+    """守卫选今晚守护谁：不能连守同一人，随机守一名存活玩家（含自己）。
+
+    守卫没有验人信息，规则上随机守护即可（守自己也是常见保命选择）；
+    省 token 又稳健，真正的「守谁」博弈交给真人守卫去玩。
+    """
+    candidates = [p for p in state.alive_players if p.uid != guard.last_guard_uid]
+    if not candidates:
+        candidates = list(state.alive_players)
+    if not candidates:
+        return None
+    return random.choice(candidates).uid
+
+
+# ============================================================
+# 出局 · 猎人开枪（轻量规则，不花 API）
+# ============================================================
+async def hunter_shoot_target(hunter: Player, state: GameState) -> int | None:
+    """猎人出局开枪带走谁：优先打自己笔记里最怀疑的人，否则随机带走一名存活玩家。"""
+    suspect = _suspect_from_notes(hunter, state)
+    if suspect is not None:
+        return suspect
+    others = [p for p in state.alive_players if p.uid != hunter.uid]
+    if not others:
+        return None
+    return random.choice(others).uid
 
 
 # ============================================================
@@ -487,6 +524,12 @@ def _speak_strategy(player: Player) -> str:
     if player.role is Role.WITCH:
         return ("你是女巫：低调找狼，别轻易暴露身份(暴露会被狼针对)，但可以引导投票。"
                 "若有可信的预言家报验了狼，就声援他、号召大家投那个狼。")
+    if player.role is Role.GUARD:
+        return ("你是守卫：低调找狼、别轻易暴露身份(暴露会被狼针对)，可以引导投票；"
+                "夜里守谁是你的秘密，发言时别直说自己守了谁。")
+    if player.role is Role.HUNTER:
+        return ("你是猎人：靠逻辑找狼，可适时亮身份用『我出局会开枪』威慑狼，也可以隐藏；"
+                "有可信预言家报验狼时号召一起投。")
     return ("你是平民：靠逻辑找狼，多分析别人的发言和票型，推动好人抓狼。"
             "若有人跳预言家报验了某人是狼且没人对跳，就明确表态跟他、号召一起投那个狼。")
 
@@ -502,7 +545,7 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
         f"你是【{player.seat}号】。{_persona_clause(player)} 你的发言要带出这个人设的语气和风格。"
         f"{_speak_strategy(player)}\n"
         f"{_NO_OMNISCIENCE}\n"
-        f"{knowledge.WEREWOLF_PLAYBOOK}\n"
+        f"{knowledge.playbook_for(p.role for p in state.players if p.role)}\n"
         "要求：\n"
         "1. 像真人在群里聊天，口语自然，有情绪、有口头禅，针对具体的人用『几号』称呼(如『我觉得3号有点跳』)。\n"
         "2. 结合你的私人笔记和场上信息，发言要有逻辑、有立场、能推动局势，别说正确的废话。\n"

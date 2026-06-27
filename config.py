@@ -39,6 +39,9 @@ MODEL_NAME: str = os.getenv("MODEL_NAME", "claude-opus-4-8")
 
 # ===== 游戏参数 =====
 TOTAL_PLAYERS: int = _int("WEREWOLF_TOTAL_PLAYERS", 6)
+# 板子预设：auto（按人数自适应，默认）/ simple / hunter / guard / classic。
+# 见 game/roles.py 的 _PRESETS；12 人推荐 classic（预女猎守）。
+BOARD: str = os.getenv("WEREWOLF_BOARD", "auto").strip().lower()
 TURN_SECONDS: int = _int("WEREWOLF_TURN_SECONDS", 60)
 # 真人打字发言/遗言的时限：给慢手留足时间（NPC 不受影响、立即生成，不会卡住）。
 SPEAK_SECONDS: int = _int("WEREWOLF_SPEAK_SECONDS", 300)

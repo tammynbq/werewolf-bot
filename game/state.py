@@ -82,13 +82,19 @@ class GameState:
     def alive_witch(self) -> Player | None:
         return next((p for p in self.alive_players if p.role is Role.WITCH), None)
 
+    def alive_guard(self) -> Player | None:
+        return next((p for p in self.alive_players if p.role is Role.GUARD), None)
+
+    def alive_hunter(self) -> Player | None:
+        return next((p for p in self.alive_players if p.role is Role.HUNTER), None)
+
     # ---------- 开局 ----------
-    def assign_roles(self) -> None:
-        """打乱并分配角色与座位号。"""
+    def assign_roles(self, board: str = "auto") -> None:
+        """打乱并分配角色与座位号。board 指定板子预设（见 roles._PRESETS）。"""
         # 先打乱玩家列表，使座位号、发言顺序都与「加入顺序」无关，
         # 避免有人对照大厅入座名单反推出某号是谁（保证匿名不被解码）。
         random.shuffle(self.players)
-        roles = role_distribution(len(self.players))
+        roles = role_distribution(len(self.players), board)
         random.shuffle(roles)
         for player, role in zip(self.players, roles):
             player.role = role
@@ -104,27 +110,36 @@ class GameState:
         kill_uid: int | None,
         witch_heal: bool = False,
         poison_uid: int | None = None,
+        guard_uid: int | None = None,
     ) -> list[Player]:
         """结算夜晚，返回本晚死亡的玩家列表（0~2 人）。
 
         kill_uid    狼队击杀目标（None / 0 = 空刀）。
         witch_heal  女巫是否对狼刀目标使用了解药（救活）。
         poison_uid  女巫毒药目标（None = 没毒）。
+        guard_uid   守卫守护目标（None = 没守 / 没有守卫）。
+
+        守护规则：被守 + 没救 → 活；被救 + 没守 → 活；**同守同救** → 死（两层保护抵消）；
+        都没有 → 死。即「守」和「救」恰好命中一个才救得活（异或）。毒药无视守护与解药。
         """
         deaths: list[Player] = []
 
-        # 狼刀（女巫救则作废）
+        # 狼刀：守护与解药「恰好一个」命中才救得活（同守同救 = 死）
         if kill_uid:
             victim = self.get(kill_uid)
-            if victim and victim.alive and not witch_heal:
-                victim.alive = False
-                deaths.append(victim)
+            if victim and victim.alive:
+                guarded = (guard_uid is not None and guard_uid == kill_uid)
+                saved = guarded != bool(witch_heal)  # XOR：同守同救则 False
+                if not saved:
+                    victim.alive = False
+                    deaths.append(victim)
 
-        # 女巫毒药
+        # 女巫毒药（无视守护/解药）；被毒死的猎人不能开枪
         if poison_uid:
             poisoned = self.get(poison_uid)
             if poisoned and poisoned.alive and poisoned not in deaths:
                 poisoned.alive = False
+                poisoned.can_shoot = False  # 经典规则：猎人被毒无法开枪
                 deaths.append(poisoned)
 
         self.night_deaths = deaths

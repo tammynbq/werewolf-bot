@@ -21,10 +21,14 @@
 | 🐺 狼人 | 每晚和狼队友在专属狼人频道商量后击杀一名玩家，目标杀光好人 |
 | 🔮 预言家 | 每晚查验一名玩家是好人还是狼人，带领好人放逐狼 |
 | 🧪 女巫 | 一瓶解药 + 一瓶毒药（各一次）：夜里得知谁被刀，可救活或毒死一人 |
+| 🏹 猎人 | 出局（被刀 / 被票出）时可开枪带走一人；被女巫毒死则不能开枪 |
+| 🛡️ 守卫 | 每晚守护一人免遭狼刀，不能连守同一人；「同守同救」会让被守的人照样死 |
 | 👤 平民 | 无技能，靠发言和投票找狼 |
 
-> 板子按总人数自动分配：狼人约占 1/3（至少 1 只），人够就配 1 预言家 + 1 女巫，其余平民。
-> 经典 6 人局即 🐺×2 / 🔮×1 / 🧪×1 / 👤×2。
+> **板子预设**（环境变量 `WEREWOLF_BOARD`，默认 `auto`）：
+> `auto` 按人数自适应 / `simple` 预女民 / `hunter` +猎人 / `guard` +守卫 /
+> `classic` 预女猎守（经典 12 人局）。狼人数恒按总人数 ≈1/3 自动算。
+> 几个 12 人方案的对比与选法见 [`docs/12人局方案.md`](docs/12人局方案.md)。
 
 ## 安装
 
@@ -41,7 +45,8 @@ cp .env.example .env   # 然后填写下面的配置
 | `OPENAI_BASE_URL` | **中转站** 地址，如 `https://your-relay.com/v1` |
 | `OPENAI_API_KEY` | 中转站分配的 key |
 | `MODEL_NAME` | 模型名（变量名与 bq-bot 对齐，如 `claude-opus-4-8` / `gpt-4o-mini`） |
-| `WEREWOLF_TOTAL_PLAYERS` | 一局总人数，人数不足用 NPC 补位（默认 6） |
+| `WEREWOLF_TOTAL_PLAYERS` | 一局总人数，人数不足用 NPC 补位（默认 6；12 人局设 12） |
+| `WEREWOLF_BOARD` | 板子预设：`auto`（默认）/ `simple` / `hunter` / `guard` / `classic` |
 | `WEREWOLF_TURN_SECONDS` | 单次发言/行动等待秒数（默认 60） |
 | `WEREWOLF_NPC_TEMPERATURE` | NPC 发言温度（默认 0.9） |
 
