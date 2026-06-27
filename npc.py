@@ -700,7 +700,7 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
         f"你是【{player.seat}号】。{_persona_clause(player)} 你的发言要带出这个人设的语气和风格。"
         f"{_speak_strategy(player)}\n"
         f"{_NO_OMNISCIENCE}\n"
-        f"{knowledge.playbook_for(p.role for p in state.players if p.role)}\n"
+        f"{knowledge.playbook_for((p.role for p in state.players if p.role), has_sheriff=state.has_sheriff)}\n"
         "要求：\n"
         "1. 像真人在群里聊天，口语自然，有情绪、有口头禅，针对具体的人用『几号』称呼(如『我觉得3号有点跳』)。\n"
         "2. 结合你的私人笔记和场上信息，发言要有逻辑、有立场、能推动局势，别说正确的废话。\n"
@@ -814,3 +814,79 @@ async def last_word(player: Player, state: GameState) -> str:
     if len(cleaned) >= 3:
         return cleaned
     return ""  # 中转站不可用：返回空串，由 bot.py 显示「没有留下遗言」，不用写死台词
+
+
+# ============================================================
+# 警长竞选
+# ============================================================
+async def sheriff_want_run(player: Player, state: GameState) -> bool:
+    """NPC 是否想参与竞选警长：预言家/悍跳狼大概率上警，其余根据角色决定。"""
+    if player.role is Role.SEER:
+        return True
+    if player.role is Role.WEREWOLF:
+        wolves = [p for p in state.players if p.role is Role.WEREWOLF]
+        if wolves and wolves[0].uid == player.uid:
+            return True  # 第一只狼悍跳上警
+        return random.random() < 0.25
+    if player.role is Role.HUNTER:
+        return random.random() < 0.4
+    if player.role is Role.WITCH:
+        return random.random() < 0.2
+    if player.role is Role.GUARD:
+        return random.random() < 0.2
+    # 平民
+    return random.random() < 0.3
+
+
+async def sheriff_speech(player: Player, state: GameState, candidates: list[Player]) -> str:
+    """NPC 竞选警长时的演讲。"""
+    secret = _role_brief(player, state)
+    cand_txt = "、".join(f"{p.seat}号" for p in candidates)
+    system = (
+        "你正在玩中文《狼人杀》，现在是警长竞选环节，你是候选人之一，要发表竞选演讲。"
+        f"你是【{player.seat}号】。{_persona_clause(player)}"
+        f"{_NO_OMNISCIENCE}\n"
+        "竞选演讲要点：说清楚你为什么适合当警长，你的逻辑和视角，"
+        "如果你是预言家可以宣布警徽流计划（今晚验谁、金水传警徽给谁、查杀传给谁），"
+        "如果你是狼人要伪装成可靠的好人来争取信任。"
+        "只说 2~4 句、30~150 字，口语化、有说服力。不要加引号、不要写名字前缀。"
+        f"{_TRANSLATE_RULE}"
+    )
+    user = (
+        f"【只有你知道的秘密】{secret}\n"
+        f"存活玩家：{_alive_roster(state)}。\n"
+        f"本轮警长候选人：{cand_txt}。\n"
+        f"你（{player.seat}号）发表竞选演讲："
+    )
+    raw = await llm.chat(system, user, max_tokens=200, temperature=0.85)
+    cleaned = _clean_speech(raw, player)
+    return cleaned if len(cleaned) >= 4 else "我觉得我能带好节奏，大家投我吧。"
+
+
+async def sheriff_vote_decision(voter: Player, state: GameState,
+                                candidates: list[Player]) -> int | None:
+    """NPC（非候选人）投票选警长：返回候选人 uid。"""
+    if not candidates:
+        return None
+    if voter.role is Role.WEREWOLF:
+        wolf_cands = [c for c in candidates if c.role is Role.WEREWOLF]
+        if wolf_cands:
+            return wolf_cands[0].uid
+        return random.choice(candidates).uid
+    return random.choice(candidates).uid
+
+
+async def sheriff_transfer(sheriff: Player, state: GameState) -> int | None:
+    """警长出局时决定警徽移交：返回目标 uid，或 None 表示撕警徽。"""
+    alive_others = [p for p in state.alive_players if p.uid != sheriff.uid]
+    if not alive_others:
+        return None
+    if sheriff.role is Role.SEER:
+        gold = [p for p in alive_others if sheriff.seer_results.get(p.uid) is False]
+        if gold:
+            return gold[-1].uid
+    suspect = _suspect_from_notes(sheriff, state)
+    trusted = [p for p in alive_others if p.uid != suspect] if suspect else alive_others
+    if trusted:
+        return random.choice(trusted).uid
+    return random.choice(alive_others).uid
