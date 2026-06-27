@@ -41,6 +41,9 @@ class Player:
     # 骑士：是否已使用翻牌决斗
     has_dueled: bool = False
 
+    # 警长（classic 12 人板有警长竞选）
+    is_sheriff: bool = False
+
     @property
     def mention(self) -> str:
         """在 Discord 里展示用：人类用 @提及，NPC 用名字。"""

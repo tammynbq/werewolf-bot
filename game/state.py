@@ -46,6 +46,8 @@ class GameState:
         self.table_size: int = 6
         # 本局板子预设（房主在大厅选；见 roles._PRESETS）。默认 auto，建局时由环境变量覆盖。
         self.board: str = "auto"
+        # 警长 uid（classic 板有警长竞选；None = 没有警长或还没选出来）
+        self.sheriff_uid: int | None = None
 
     # ---------- 玩家管理 ----------
     def get(self, uid: int) -> Player | None:
@@ -89,6 +91,29 @@ class GameState:
 
     def alive_hunter(self) -> Player | None:
         return next((p for p in self.alive_players if p.role is Role.HUNTER), None)
+
+    @property
+    def has_sheriff(self) -> bool:
+        """本局是否启用警长竞选（classic 板 + 人数 >= 9）。"""
+        return self.board == "classic" and len(self.players) >= 9
+
+    def sheriff_player(self) -> Player | None:
+        if self.sheriff_uid is None:
+            return None
+        return self.get(self.sheriff_uid)
+
+    def transfer_sheriff(self, new_uid: int | None) -> None:
+        """警徽移交：传给 new_uid，或 None 表示撕警徽。"""
+        old = self.sheriff_player()
+        if old:
+            old.is_sheriff = False
+        if new_uid is not None:
+            p = self.get(new_uid)
+            if p and p.alive:
+                p.is_sheriff = True
+                self.sheriff_uid = new_uid
+                return
+        self.sheriff_uid = None
 
     # ---------- 开局 ----------
     def assign_roles(self, board: str = "auto") -> None:
@@ -155,11 +180,15 @@ class GameState:
 
         返回 (被放逐玩家或 None, 是否平票)。平票则无人出局。
         白痴首次被票出时免死（翻牌），由调用方处理。
+        警长的票权重 1.5（四舍五入用浮点累加再比较）。
         """
         if not votes:
             return None, False
-        tally = Counter(votes.values())
-        top = tally.most_common()
+        tally: dict[int, float] = {}
+        for voter_uid, target_uid in votes.items():
+            weight = 1.5 if voter_uid == self.sheriff_uid else 1.0
+            tally[target_uid] = tally.get(target_uid, 0.0) + weight
+        top = sorted(tally.items(), key=lambda x: x[1], reverse=True)
         highest = top[0][1]
         leaders = [uid for uid, c in top if c == highest]
         if len(leaders) != 1:

@@ -122,7 +122,8 @@ def roster_block(state: GameState, *, speeches: bool = False,
     lines = []
     for p in state.players:
         mark = "🟢" if p.alive else "⚫"
-        line = f"{mark} {p.label}"
+        badge = "👑" if p.is_sheriff else ""
+        line = f"{mark}{badge} {p.label}"
         if speeches:
             if p.uid == speaking_uid:
                 line += "：💬 发言中…"
@@ -587,6 +588,370 @@ class VoteGateView(discord.ui.View):
         await interaction.response.send_message("⏩ 提前结束投票，公布结果…", ephemeral=True)
         self._done.set()
         self.stop()
+
+
+# ============================================================
+# 警长竞选
+# ============================================================
+class SheriffRunView(discord.ui.View):
+    """警长竞选报名阶段：存活玩家点按钮决定上警/不上警。"""
+
+    def __init__(self, state: GameState, panel: Panel, candidates: set[int],
+                 decided: set[int], human_ids: set[int], done: asyncio.Event, timeout: int):
+        super().__init__(timeout=timeout)
+        self.state = state
+        self.panel = panel
+        self.candidates = candidates
+        self.decided = decided
+        self.human_ids = human_ids
+        self.done = done
+
+    @discord.ui.button(label="上警", style=discord.ButtonStyle.success, emoji="🎖️")
+    async def run_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = interaction.user.id
+        if uid not in self.human_ids:
+            await interaction.response.send_message("你不是存活玩家。", ephemeral=True)
+            return
+        self.candidates.add(uid)
+        self.decided.add(uid)
+        await interaction.response.send_message("🎖️ 你已报名竞选警长！", ephemeral=True)
+        if self.decided >= self.human_ids:
+            self.done.set()
+
+    @discord.ui.button(label="不上警", style=discord.ButtonStyle.secondary, emoji="🙅")
+    async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = interaction.user.id
+        if uid not in self.human_ids:
+            await interaction.response.send_message("你不是存活玩家。", ephemeral=True)
+            return
+        self.candidates.discard(uid)
+        self.decided.add(uid)
+        await interaction.response.send_message("🙅 你选择不参与竞选。", ephemeral=True)
+        if self.decided >= self.human_ids:
+            self.done.set()
+
+
+class SheriffVoteSelect(discord.ui.Select):
+    """投票选警长——候选人之外的存活玩家投票。"""
+
+    def __init__(self, voter_id: int, candidates: list, votes: dict[int, int],
+                 allowed_ids: set[int], done: asyncio.Event):
+        options = [discord.SelectOption(label=f"{c.label}", value=str(c.uid)) for c in candidates]
+        super().__init__(placeholder="选择你支持的警长候选人…", min_values=1, max_values=1, options=options)
+        self._voter = voter_id
+        self._votes = votes
+        self._allowed = allowed_ids
+        self._done = done
+
+    async def callback(self, interaction: discord.Interaction):
+        choice = int(self.values[0])
+        self._votes[self._voter] = choice
+        await interaction.response.edit_message(
+            content=f"🗳️ 已投票！（想改票就再点面板上的投票按钮）", view=None)
+        if self._allowed and set(self._votes.keys()) >= self._allowed:
+            self._done.set()
+
+
+class SheriffVoteGateView(discord.ui.View):
+    """竞选投票入口：非候选人点按钮弹出选单。"""
+
+    def __init__(self, candidates: list, allowed_ids: set[int],
+                 host_id: int, votes: dict[int, int], done: asyncio.Event, timeout: int):
+        super().__init__(timeout=timeout)
+        self._candidates = candidates
+        self._allowed = allowed_ids
+        self._host_id = host_id
+        self._votes = votes
+        self._done = done
+
+    @discord.ui.button(label="投票选警长", style=discord.ButtonStyle.success, emoji="🗳️")
+    async def vote(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = interaction.user.id
+        if uid not in self._allowed:
+            await interaction.response.send_message("你是候选人或非存活玩家，不能投票。", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=self.timeout)
+        view.add_item(SheriffVoteSelect(uid, self._candidates, self._votes, self._allowed, self._done))
+        await interaction.response.send_message("请选择你支持的警长候选人：", view=view, ephemeral=True)
+
+    @discord.ui.button(label="结束投票", style=discord.ButtonStyle.primary, emoji="⏩")
+    async def finish(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self._host_id:
+            await interaction.response.send_message("只有房主能提前结束投票。", ephemeral=True)
+            return
+        await interaction.response.send_message("⏩ 提前结束投票…", ephemeral=True)
+        self._done.set()
+        self.stop()
+
+
+class SheriffTransferSelect(discord.ui.Select):
+    """警长出局时选择移交警徽。"""
+
+    def __init__(self, sheriff, state: GameState, result: dict, done: asyncio.Event):
+        options = [discord.SelectOption(label="❌ 撕掉警徽", value="0")]
+        options += [discord.SelectOption(label=p.label, value=str(p.uid))
+                    for p in state.alive_players if p.uid != sheriff.uid]
+        super().__init__(placeholder="选择警徽移交对象…", min_values=1, max_values=1, options=options)
+        self._sheriff = sheriff
+        self._state = state
+        self._result = result
+        self._done = done
+
+    async def callback(self, interaction: discord.Interaction):
+        val = int(self.values[0])
+        self._result["uid"] = val if val != 0 else None
+        self._done.set()
+        if val == 0:
+            await interaction.response.edit_message(content="❌ 你撕掉了警徽！", view=None)
+        else:
+            target = self._state.get(val)
+            await interaction.response.edit_message(
+                content=f"👑 你把警徽移交给了 **{target.label}**。", view=None)
+
+
+class SheriffTransferGateView(discord.ui.View):
+    """警长出局时的面板入口。"""
+
+    def __init__(self, sheriff, state: GameState, result: dict, done: asyncio.Event, timeout: int):
+        super().__init__(timeout=timeout)
+        self._sheriff = sheriff
+        self._state = state
+        self._result = result
+        self._done = done
+
+    @discord.ui.button(label="移交警徽", style=discord.ButtonStyle.primary, emoji="👑")
+    async def act(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self._sheriff.uid:
+            await interaction.response.send_message("只有警长本人能操作。", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=self.timeout)
+        view.add_item(SheriffTransferSelect(self._sheriff, self._state, self._result, self._done))
+        await interaction.response.send_message(
+            "👑 你是警长，出局了——选择把警徽移交给谁，或撕掉警徽：", view=view, ephemeral=True)
+
+
+async def phase_sheriff_election(bot, state: GameState, panel: Panel, channel, day_log: list[str]) -> None:
+    """第一天白天讨论前：警长竞选（上警 → 竞选演讲 → 投票 → 宣布警长）。"""
+    title = "🎖️ 第 1 天 · 警长竞选"
+
+    # 1) 报名阶段：NPC 自动决定，真人点按钮
+    candidates: set[int] = set()
+    decided: set[int] = set()
+    human_ids = {p.uid for p in state.alive_players if not p.is_npc}
+
+    for p in state.alive_players:
+        if p.is_npc:
+            want = await npc.sheriff_want_run(p, state)
+            if want:
+                candidates.add(p.uid)
+            decided.add(p.uid)
+
+    if human_ids:
+        done = asyncio.Event()
+        view = SheriffRunView(state, panel, candidates, decided, human_ids, done, TURN)
+        cand_npc_txt = "、".join(state.get(uid).label for uid in candidates) if candidates else "暂无"
+        await panel.show(
+            title=title,
+            desc=(f"🎖️ **警长竞选报名**\n\n"
+                  f"想参与竞选的玩家点『上警』，不想参与点『不上警』。\n"
+                  f"已报名：{cand_npc_txt}\n\n{roster_block(state)}"),
+            color=C_DAY, view=view,
+        )
+        await wait_event(done, TURN)
+        view.stop()
+
+    cand_players = [p for p in state.alive_players if p.uid in candidates]
+    if len(cand_players) == 0:
+        await panel.show(title=title, desc="没有人报名竞选，本局不设警长。\n\n" + roster_block(state), color=C_DAY)
+        day_log.append("警长竞选：无人上警，本局不设警长。")
+        await asyncio.sleep(2)
+        return
+    if len(cand_players) == 1:
+        winner = cand_players[0]
+        winner.is_sheriff = True
+        state.sheriff_uid = winner.uid
+        await panel.show(
+            title=title,
+            desc=f"只有 **{winner.label}** 报名，自动当选警长 👑\n\n{roster_block(state)}",
+            color=C_DAY,
+        )
+        day_log.append(f"警长竞选：{winner.seat}号自动当选警长。")
+        await asyncio.sleep(2)
+        return
+
+    # 2) 竞选演讲
+    await panel.ensure_bottom()
+    for p in state.players:
+        p.last_speech = ""
+    for player in cand_players:
+        if player.is_npc:
+            await panel.show(
+                title=title,
+                desc=roster_block(state, speeches=True, speaking_uid=player.uid),
+                color=C_DAY, footer="候选人轮流发表竞选演讲",
+            )
+            async with channel.typing():
+                try:
+                    speech = await asyncio.wait_for(
+                        npc.sheriff_speech(player, state, cand_players),
+                        timeout=config.NPC_THINK_SECONDS)
+                except asyncio.TimeoutError:
+                    speech = "大家投我吧，我能带好节奏。"
+                await asyncio.sleep(min(7.0, 1.5 + len(speech) * 0.12))
+            player.last_speech = speech
+            day_log.append(f"{player.seat}号(竞选): {speech}")
+            await panel.show(title=title, desc=roster_block(state, speeches=True),
+                             color=C_DAY, footer="候选人轮流发表竞选演讲")
+            await asyncio.sleep(0.6)
+        else:
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future = loop.create_future()
+            state.current_speaker_uid = player.uid
+            view = SpeechGateView(player, fut, btn_label="竞选演讲", modal_title="你的竞选演讲",
+                                  input_label="说说你为什么适合当警长", timeout=SPEAK + 120)
+            await dm_user(player.uid, f"🎖️ 轮到你（{player.seat}号）发表竞选演讲了，回游戏面板点按钮。")
+            await panel.show(
+                title=title,
+                desc=(roster_block(state, speeches=True, speaking_uid=player.uid)
+                      + f"\n\n🎤 轮到 **{player.seat}号** 发表竞选演讲。"),
+                color=C_DAY, view=view,
+            )
+            try:
+                text = await asyncio.wait_for(fut, timeout=SPEAK)
+                if text.strip():
+                    player.last_speech = text
+                    day_log.append(f"{player.seat}号(竞选): {text}")
+                else:
+                    player.last_speech = "（选择不发言）"
+                    day_log.append(f"{player.seat}号(竞选): （沉默）")
+            except asyncio.TimeoutError:
+                player.last_speech = "（超时，跳过演讲）"
+                day_log.append(f"{player.seat}号(竞选): （沉默/超时）")
+            finally:
+                state.current_speaker_uid = None
+                view.stop()
+            await panel.show(title=title, desc=roster_block(state, speeches=True),
+                             color=C_DAY, footer="候选人轮流发表竞选演讲")
+
+    # 3) 投票选警长（非候选人投票）
+    voter_ids = {p.uid for p in state.alive_players if p.uid not in candidates}
+    human_voter_ids = {uid for uid in voter_ids if not state.get(uid).is_npc}
+    votes: dict[int, int] = {}
+
+    if human_voter_ids:
+        done = asyncio.Event()
+        view = SheriffVoteGateView(cand_players, human_voter_ids, state.host_id, votes, done, VOTE)
+        cand_txt = "、".join(f"**{p.label}**" for p in cand_players)
+        await panel.show(
+            title=title,
+            desc=(roster_block(state, speeches=True)
+                  + f"\n\n🗳️ 非候选人投票选警长（候选人：{cand_txt}）"),
+            color=C_DAY,
+        )
+        vote_embed = discord.Embed(
+            title="🗳️ 投票选警长",
+            description=f"非候选人玩家点下方按钮投票（{VOTE} 秒内）。",
+            color=C_DAY,
+        )
+        vote_msg = await channel.send(embed=vote_embed, view=view)
+        await wait_event(done, VOTE)
+        view.stop()
+        try:
+            await vote_msg.edit(view=None)
+        except discord.HTTPException:
+            pass
+
+    # NPC（非候选人）投票
+    for p in state.alive_players:
+        if p.is_npc and p.uid not in candidates:
+            t = await npc.sheriff_vote_decision(p, state, cand_players)
+            if t is not None:
+                votes[p.uid] = t
+
+    # 4) 统计并宣布警长
+    tally: dict[int, int] = {}
+    for target_uid in votes.values():
+        tally[target_uid] = tally.get(target_uid, 0) + 1
+
+    if tally:
+        lines = []
+        for uid, count in sorted(tally.items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"**{state.get(uid).label}**：{count} 票")
+        await channel.send("📊 警长竞选结果：\n" + "\n".join(lines))
+
+        top_count = max(tally.values())
+        leaders = [uid for uid, c in tally.items() if c == top_count]
+        if len(leaders) == 1:
+            winner = state.get(leaders[0])
+            winner.is_sheriff = True
+            state.sheriff_uid = winner.uid
+            await panel.show(
+                title=title,
+                desc=f"👑 **{winner.label}** 当选警长！\n\n{roster_block(state)}",
+                color=C_DAY,
+            )
+            day_log.append(f"警长竞选：{winner.seat}号当选警长。")
+        else:
+            tied = "、".join(f"**{state.get(uid).label}**" for uid in leaders)
+            await panel.show(
+                title=title,
+                desc=f"⚖️ {tied} 平票，本局不设警长。\n\n{roster_block(state)}",
+                color=C_DAY,
+            )
+            day_log.append("警长竞选：平票，本局不设警长。")
+    else:
+        await panel.show(title=title, desc="无人投票，本局不设警长。\n\n" + roster_block(state), color=C_DAY)
+        day_log.append("警长竞选：无人投票，本局不设警长。")
+
+    await asyncio.sleep(2)
+
+
+async def handle_sheriff_transfer(state: GameState, panel: Panel, channel,
+                                  dead_player, day_log: list[str]) -> None:
+    """如果出局的人是警长，处理警徽移交。"""
+    if state.sheriff_uid is None or dead_player.uid != state.sheriff_uid:
+        return
+    title = "👑 警徽移交"
+
+    if dead_player.is_npc:
+        target_uid = await npc.sheriff_transfer(dead_player, state)
+        if target_uid:
+            target = state.get(target_uid)
+            state.transfer_sheriff(target_uid)
+            await channel.send(f"👑 **{dead_player.label}**（警长）把警徽移交给了 **{target.label}**。")
+            day_log.append(f"{dead_player.seat}号(警长)把警徽移交给{target.seat}号。")
+        else:
+            state.transfer_sheriff(None)
+            await channel.send(f"❌ **{dead_player.label}**（警长）撕掉了警徽！")
+            day_log.append(f"{dead_player.seat}号(警长)撕掉了警徽。")
+    else:
+        result: dict = {"uid": "pending"}
+        done = asyncio.Event()
+        view = SheriffTransferGateView(dead_player, state, result, done, TURN)
+        await dm_user(dead_player.uid, f"👑 你是警长且出局了，回游戏面板决定警徽移交。")
+        await panel.show(
+            title=title,
+            desc=(f"👑 **{dead_player.label}** 是警长，出局了——\n"
+                  f"请点按钮决定警徽移交给谁或撕掉警徽。\n\n{roster_block(state)}"),
+            color=C_DAY, view=view,
+        )
+        await wait_event(done, TURN)
+        view.stop()
+        target_uid = result.get("uid", "pending")
+        if target_uid == "pending":
+            target_uid = None
+        if target_uid:
+            target = state.get(target_uid)
+            state.transfer_sheriff(target_uid)
+            await channel.send(f"👑 **{dead_player.label}**（警长）把警徽移交给了 **{target.label}**。")
+            day_log.append(f"{dead_player.seat}号(警长)把警徽移交给{target.seat}号。")
+        else:
+            state.transfer_sheriff(None)
+            await channel.send(f"❌ **{dead_player.label}**（警长）撕掉了警徽！")
+            day_log.append(f"{dead_player.seat}号(警长)撕掉了警徽。")
+
+    await panel.show(title=title, desc=roster_block(state), color=C_DAY)
+    await asyncio.sleep(1.5)
 
 
 # ============================================================
@@ -1140,6 +1505,7 @@ async def hunter_shoot(bot, state: GameState, panel: Panel, channel, hunter, day
         f"其身份是 {target.role.emoji}**{target.role.cn}**。")
     day_log.append(f"{hunter.seat}号(猎人)开枪带走{target.seat}号。")
     await collect_last_words(state, panel, channel, target, day_log=day_log)
+    await handle_sheriff_transfer(state, panel, channel, target, day_log)
 
 
 async def wolf_king_shoot(bot, state: GameState, panel: Panel, channel, wolf_king, day_log: list[str]) -> None:
@@ -1198,6 +1564,7 @@ async def announce_deaths(bot, state: GameState, panel: Panel, channel, deaths: 
     await asyncio.sleep(1.5)
     for d in deaths:
         await collect_last_words(state, panel, channel, d, title=title, day_log=day_log)
+        await handle_sheriff_transfer(state, panel, channel, d, day_log)
         # 猎人被狼刀出局可开枪（被女巫毒死时 can_shoot 已为 False）
         await hunter_shoot(bot, state, panel, channel, d, day_log)
 
@@ -1401,11 +1768,21 @@ async def phase_vote(bot, state: GameState, panel: Panel, channel, day_log: list
     abstainers = [state.get(v).label for v, t in votes.items() if t == 0]
 
     if real_votes or abstainers:
-        tally = Counter(real_votes.values())
+        weighted_tally: dict[int, float] = {}
+        for voter_uid, target_uid in real_votes.items():
+            w = 1.5 if voter_uid == state.sheriff_uid else 1.0
+            weighted_tally[target_uid] = weighted_tally.get(target_uid, 0.0) + w
         lines = []
-        for target_uid, count in tally.most_common():
-            voters = [state.get(v).label for v, tt in real_votes.items() if tt == target_uid]
-            lines.append(f"**{state.get(target_uid).label}**：{count} 票（{', '.join(voters)}）")
+        for target_uid, wcount in sorted(weighted_tally.items(), key=lambda x: x[1], reverse=True):
+            voters = []
+            for v, tt in real_votes.items():
+                if tt == target_uid:
+                    lbl = state.get(v).label
+                    if v == state.sheriff_uid:
+                        lbl += "👑"
+                    voters.append(lbl)
+            disp = f"{wcount:g}" if wcount != int(wcount) else str(int(wcount))
+            lines.append(f"**{state.get(target_uid).label}**：{disp} 票（{', '.join(voters)}）")
         if abstainers:
             lines.append(f"🙅 弃权：{len(abstainers)} 票（{', '.join(abstainers)}）")
         await channel.send("📊 投票结果：\n" + "\n".join(lines))
@@ -1430,6 +1807,7 @@ async def phase_vote(bot, state: GameState, panel: Panel, channel, day_log: list
         await collect_last_words(state, panel, channel, exiled,
                                  title="🗳️ 第 %d 天 · 投票放逐" % state.day_count,
                                  day_log=day_log)
+        await handle_sheriff_transfer(state, panel, channel, exiled, day_log)
         # 猎人被票出可开枪带走一人
         await hunter_shoot(bot, state, panel, channel, exiled, day_log)
         # 白狼王被票出可带走一人
@@ -1479,6 +1857,10 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
             await announce_deaths(bot, state, panel, channel, deaths, day_log)
             if state.check_winner():
                 break
+
+            # 第一天白天讨论前：警长竞选（仅 classic 板 + 人数 >= 9）
+            if state.day_count == 1 and state.has_sheriff:
+                await phase_sheriff_election(bot, state, panel, channel, day_log)
 
             await phase_discussion(bot, state, panel, channel, day_log)
             await phase_vote(bot, state, panel, channel, day_log)
