@@ -983,13 +983,16 @@ async def phase_witch(bot, state: GameState, panel: Panel, kill_uid: int | None)
 
 
 async def collect_last_words(state: GameState, panel: Panel, channel, player,
-                             title: str = "🪦 遗言") -> None:
+                             title: str = "🪦 遗言",
+                             day_log: list[str] | None = None) -> None:
     """出局玩家留遗言：NPC 由 LLM 生成；真人通过面板弹窗输入。
     遗言同样落在面板里出局者的 ⚫ 灯旁边，不再往下另发消息。"""
     if player.is_npc:
         text = await npc.last_word(player, state)
         player.last_speech = f"🪦 {text}" if text else "🪦 （没有留下遗言）"
         await panel.show(title=title, desc=roster_block(state, speeches=True), color=C_DAY)
+        if day_log is not None and text:
+            day_log.append(f"{player.seat}号(遗言): {text}")
         return
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
@@ -1008,10 +1011,13 @@ async def collect_last_words(state: GameState, panel: Panel, channel, player,
         text = await asyncio.wait_for(fut, timeout=SPEAK)
         player.last_speech = f"🪦 {text}" if text.strip() else "🪦 （没有留下遗言）"
     except asyncio.TimeoutError:
+        text = ""
         player.last_speech = "🪦 （没有留下遗言）"
     finally:
         state.current_speaker_uid = None
         view.stop()
+    if day_log is not None and text and text.strip():
+        day_log.append(f"{player.seat}号(遗言): {text.strip()}")
     await panel.show(title=title, desc=roster_block(state, speeches=True), color=C_DAY)
 
 
@@ -1133,7 +1139,7 @@ async def hunter_shoot(bot, state: GameState, panel: Panel, channel, hunter, day
         f"🏹 **{hunter.label}**（猎人）开枪带走了 **{target.label}**，"
         f"其身份是 {target.role.emoji}**{target.role.cn}**。")
     day_log.append(f"{hunter.seat}号(猎人)开枪带走{target.seat}号。")
-    await collect_last_words(state, panel, channel, target)
+    await collect_last_words(state, panel, channel, target, day_log=day_log)
 
 
 async def wolf_king_shoot(bot, state: GameState, panel: Panel, channel, wolf_king, day_log: list[str]) -> None:
@@ -1191,7 +1197,7 @@ async def announce_deaths(bot, state: GameState, panel: Panel, channel, deaths: 
         day_log.append(f"第{state.day_count}晚，{d.seat}号出局。")
     await asyncio.sleep(1.5)
     for d in deaths:
-        await collect_last_words(state, panel, channel, d, title=title)
+        await collect_last_words(state, panel, channel, d, title=title, day_log=day_log)
         # 猎人被狼刀出局可开枪（被女巫毒死时 can_shoot 已为 False）
         await hunter_shoot(bot, state, panel, channel, d, day_log)
 
@@ -1422,7 +1428,8 @@ async def phase_vote(bot, state: GameState, panel: Panel, channel, day_log: list
             f"🔨 **{exiled.label}** 被放逐出局，身份是 {exiled.role.emoji}**{exiled.role.cn}**。")
         day_log.append(f"{exiled.seat}号 被投票放逐，身份是{exiled.role.cn}。")
         await collect_last_words(state, panel, channel, exiled,
-                                 title="🗳️ 第 %d 天 · 投票放逐" % state.day_count)
+                                 title="🗳️ 第 %d 天 · 投票放逐" % state.day_count,
+                                 day_log=day_log)
         # 猎人被票出可开枪带走一人
         await hunter_shoot(bot, state, panel, channel, exiled, day_log)
         # 白狼王被票出可带走一人
