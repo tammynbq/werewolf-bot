@@ -2157,6 +2157,44 @@ async def announce_end(channel, panel: Panel, state: GameState) -> None:
     await panel.show(title=title, desc=state.public_roles_reveal(), color=color)
 
 
+async def _purge_bot_messages(bot: discord.Client, channel, limit: int = 200) -> int:
+    """删除 channel 里 bot 自己发的消息（最近 limit 条），返回删除数量。"""
+    def is_mine(m: discord.Message) -> bool:
+        return m.author.id == bot.user.id
+    try:
+        deleted = await channel.purge(limit=limit, check=is_mine)
+        return len(deleted)
+    except discord.Forbidden:
+        n = 0
+        async for m in channel.history(limit=limit):
+            if is_mine(m):
+                try:
+                    await m.delete()
+                    n += 1
+                except discord.HTTPException:
+                    pass
+        return n
+    except discord.HTTPException:
+        return 0
+
+
+async def _cleanup_after_game(bot: discord.Client, wolf_thread_id: int | None, origin_channel_id: int | None) -> None:
+    """游戏结束 CLEANUP_DELAY_SECONDS 秒后：删除本局狼人专属子区，并清理频道里
+    残留的狼人杀消息（如已经过期的大厅面板）。"""
+    await asyncio.sleep(config.CLEANUP_DELAY_SECONDS)
+    if wolf_thread_id:
+        wt = bot.get_channel(wolf_thread_id)
+        if isinstance(wt, discord.Thread):
+            try:
+                await wt.delete()
+            except discord.HTTPException:
+                pass
+    if origin_channel_id:
+        origin = bot.get_channel(origin_channel_id)
+        if origin is not None:
+            await _purge_bot_messages(bot, origin)
+
+
 async def run_game(bot: discord.Client, state: GameState, channel) -> None:
     state.play_channel_id = channel.id
     panel = Panel(channel)
@@ -2221,14 +2259,10 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
                 await channel.edit(archived=True)
             except discord.HTTPException:
                 pass
-        # 顺手归档狼人频道
-        if state.wolf_thread_id:
-            wt = bot.get_channel(state.wolf_thread_id)
-            if isinstance(wt, discord.Thread):
-                try:
-                    await wt.edit(archived=True)
-                except discord.HTTPException:
-                    pass
+        # 狼人子区留够时间让狼队复盘，CLEANUP_DELAY_SECONDS 秒后自动删除；
+        # 同时清理频道里残留的狼人杀消息（如已经过期的大厅面板）。
+        asyncio.create_task(
+            _cleanup_after_game(bot, state.wolf_thread_id, state.channel_id))
 
 
 # ============================================================
@@ -2332,24 +2366,7 @@ async def clear(interaction: discord.Interaction, count: int = 100):
         return
     count = max(1, min(count, 200))
     await interaction.response.defer(ephemeral=True)
-    channel = interaction.channel
-    me_id = interaction.client.user.id
-
-    def is_mine(m: discord.Message) -> bool:
-        return m.author.id == me_id
-
-    try:
-        deleted = await channel.purge(limit=count, check=is_mine)
-        n = len(deleted)
-    except discord.Forbidden:
-        n = 0
-        async for m in channel.history(limit=count):
-            if is_mine(m):
-                try:
-                    await m.delete()
-                    n += 1
-                except discord.HTTPException:
-                    pass
+    n = await _purge_bot_messages(interaction.client, interaction.channel, count)
     await interaction.followup.send(f"🧹 已清理 {n} 条狼人杀消息。", ephemeral=True)
 
 
