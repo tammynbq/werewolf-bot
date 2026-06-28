@@ -19,6 +19,10 @@ class Player:
     # 仅 NPC 用：性格设定，喂给 LLM 让发言有差异
     persona: str = ""
 
+    # 仅 NPC 用：本局玩家在大厅给它指定的私有 LLM 站（玩家自带 API）。
+    # 形如 {"name","base_url","api_key","model"}；None=走默认站 / CHARACTER_API。
+    api_profile: dict | None = None
+
     # 本轮显示在面板「灯旁边」的发言（白天发言 / 遗言）。每天天亮时清空。
     last_speech: str = ""
 

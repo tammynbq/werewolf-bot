@@ -22,6 +22,7 @@ from discord import app_commands
 import config
 import llm
 import npc
+import userapi
 from characters import CHARACTER_NPCS
 from game.roles import BOARD_NAMES, Role, summarize_distribution
 from game.state import GameState, Phase, Team
@@ -977,11 +978,250 @@ class NpcPickSelect(discord.ui.Select):
         self._lobby = lobby
 
     async def callback(self, interaction: discord.Interaction):
-        self._state.chosen_npc_names = list(self.values)
+        state = self._state
+        host = state.host_id
+        # 保护别人加的、或已绑了自有 API 的 NPC：房主的多选只管「房主名下、走 bot API」那批，
+        # 不覆盖其它玩家用自己 key 认领的角色。
+        protected = [n for n in state.chosen_npc_names
+                     if n in state.npc_api or state.npc_owner.get(n) not in (None, host)]
+        host_pick = [n for n in self.values if n not in protected]
+        state.chosen_npc_names = protected + host_pick
+        # 重建房主名下条目的归属；被房主取消选中的（bot API、房主名下）随重建自然移除
+        for n in list(state.npc_owner):
+            if state.npc_owner.get(n) == host and n not in state.npc_api and n not in host_pick:
+                state.npc_owner.pop(n, None)
+        for n in host_pick:
+            state.npc_owner[n] = host
         picked = "、".join(self.values) if self.values else "（不指定，自动补位）"
         await interaction.response.edit_message(
             content=f"✅ 已设定本局 AI 角色：{picked}", view=None)
         await self._lobby.refresh()
+
+
+# ============================================================
+# 玩家私有 API + 自助加入 AI（需求4）
+# ============================================================
+# 非房主玩家用 bot 的 API 最多加几个 AI（用自己 API 的不受此限）。
+BOT_API_NPC_CAP = 2
+_BOT_STATION = "__bot__"  # 站位特殊值：用 bot 默认 API
+
+
+def _my_bot_api_npcs(state: GameState, uid: int) -> list[str]:
+    """该玩家名下、走 bot 默认 API 的 NPC（用于人均上限统计）。"""
+    return [n for n in state.chosen_npc_names
+            if state.npc_owner.get(n) == uid and n not in state.npc_api]
+
+
+async def _assign_npc(state: GameState, uid: int, char_name: str,
+                      station: "userapi.Station | None") -> str:
+    """把某 AI 角色加入本局并指定其 API。station=None 表示走 bot 默认 API。
+    返回给玩家看的结果文案（含连通测试/上限校验）。"""
+    if char_name not in {c.name for c in CHARACTER_NPCS}:
+        return "❌ 没有这个 AI 角色。"
+    # bot 默认 API：非房主有人均上限（用自己 API 的不限）
+    if station is None and uid != state.host_id:
+        mine = _my_bot_api_npcs(state, uid)
+        if char_name not in mine and len(mine) >= BOT_API_NPC_CAP:
+            return (f"❌ 用 🤖 bot 的 API 最多加 {BOT_API_NPC_CAP} 个 AI"
+                    f"（想加更多就给它指定你自己的 API 站）。")
+    # 自己的站：先测连通，连不上就不加，免得开局 NPC 集体哑火
+    if station is not None:
+        good, why = await llm.health_check_profile(station.as_profile())
+        if not good:
+            return f"🔴 你的站「{station.label}」连不上：{why}\n（没有加入，先去『添加/检查我的 API』）"
+    if char_name not in state.chosen_npc_names:
+        state.chosen_npc_names.append(char_name)
+    state.npc_owner[char_name] = uid
+    if station is None:
+        state.npc_api.pop(char_name, None)
+        return f"✅ 已加入 AI「{char_name}」，用 🤖 bot 默认 API。"
+    state.npc_api[char_name] = station.as_profile()
+    return (f"✅ 已加入 AI「{char_name}」，用你的站「{station.label}」"
+            f"（模型 {station.model}）🟢。")
+
+
+class AddStationModal(discord.ui.Modal, title="添加我的 API 站（私密保存）"):
+    f_label = discord.ui.TextInput(
+        label="站名（自取，方便你自己区分）", required=False,
+        placeholder="如：我的Gemini / 备用站", max_length=20)
+    f_base = discord.ui.TextInput(
+        label="base_url（OpenAI 兼容，通常以 /v1 结尾）",
+        placeholder="https://xxx.com/v1")
+    f_key = discord.ui.TextInput(
+        label="API key（只存内存、永不回显明文）",
+        placeholder="sk-...")
+    f_model = discord.ui.TextInput(
+        label="模型名", placeholder="如 gemini-2.0-flash / gpt-4o-mini")
+
+    def __init__(self, hub: "ApiHubView"):
+        super().__init__()
+        self._hub = hub
+
+    async def on_submit(self, interaction: discord.Interaction):
+        uid = interaction.user.id
+        ok, info = userapi.add_station(
+            uid, str(self.f_label), str(self.f_base),
+            str(self.f_key), str(self.f_model))
+        if not ok:
+            await interaction.response.send_message(f"❌ {info}", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"✅ 已**私密**保存站「{info}」（别人看不到你的 key）。正在测试连通…",
+            ephemeral=True)
+        station = userapi.get_station(uid, info)
+        good, why = await llm.health_check_profile(station.as_profile())
+        tag = "🟢 可用" if good else f"🔴 {why}"
+        await interaction.followup.send(f"站「{info}」连通测试：{tag}", ephemeral=True)
+
+
+class StationRemoveSelect(discord.ui.Select):
+    def __init__(self, uid: int):
+        opts = [discord.SelectOption(label=s.label,
+                                     description=f"{s.model}｜key {userapi.mask_key(s.api_key)}")
+                for s in userapi.list_stations(uid)]
+        super().__init__(placeholder="选择要删除的站…", min_values=1,
+                         max_values=1, options=opts or [
+                             discord.SelectOption(label="（无）", value="__none__")])
+
+    async def callback(self, interaction: discord.Interaction):
+        val = self.values[0]
+        if val == "__none__":
+            await interaction.response.edit_message(content="（没有站可删）", view=None)
+            return
+        userapi.remove_station(interaction.user.id, val)
+        await interaction.response.edit_message(
+            content=f"🗑 已删除站「{val}」。", view=None)
+
+
+class NpcCharSelect(discord.ui.Select):
+    """第一步：选一个要加入/认领的 AI 角色。"""
+
+    def __init__(self, hub: "ApiHubView"):
+        opts = [discord.SelectOption(label=c.name, value=c.name,
+                                     description=((c.intro or "AI 角色")[:100]))
+                for c in CHARACTER_NPCS][:25]
+        super().__init__(placeholder="① 选一个要加入的 AI 角色…",
+                         min_values=1, max_values=1, options=opts)
+        self._hub = hub
+
+    async def callback(self, interaction: discord.Interaction):
+        char = self.values[0]
+        view = discord.ui.View(timeout=120)
+        view.add_item(NpcStationSelect(self._hub, char))
+        await interaction.response.edit_message(
+            content=f"② 给 AI「{char}」选用哪个 API：", view=view)
+
+
+class NpcStationSelect(discord.ui.Select):
+    """第二步：给选定角色指定 API（bot 默认 / 自己的某个站）。"""
+
+    def __init__(self, hub: "ApiHubView", char_name: str):
+        self._hub = hub
+        self._char = char_name
+        opts = [discord.SelectOption(
+            label="🤖 用 bot 默认 API", value=_BOT_STATION,
+            description="不花你自己的额度（非房主最多 2 个）")]
+        for s in userapi.list_stations(hub.uid):
+            opts.append(discord.SelectOption(
+                label=f"我的站：{s.label}", value=s.label,
+                description=f"{s.model}｜key {userapi.mask_key(s.api_key)}"))
+        super().__init__(placeholder="② 选用哪个 API…", min_values=1,
+                         max_values=1, options=opts)
+
+    async def callback(self, interaction: discord.Interaction):
+        val = self.values[0]
+        station = None if val == _BOT_STATION else userapi.get_station(
+            interaction.user.id, val)
+        if val != _BOT_STATION and station is None:
+            await interaction.response.edit_message(
+                content="❌ 找不到这个站（可能已删），重来一次。", view=None)
+            return
+        await interaction.response.edit_message(content="⏳ 处理中…", view=None)
+        msg = await _assign_npc(self._hub.state, interaction.user.id, self._char, station)
+        await interaction.followup.send(msg, ephemeral=True)
+        await self._hub.lobby.refresh()
+
+
+class MyNpcRemoveSelect(discord.ui.Select):
+    """移除自己加入的 AI。"""
+
+    def __init__(self, hub: "ApiHubView"):
+        self._hub = hub
+        mine = [n for n in hub.state.chosen_npc_names
+                if hub.state.npc_owner.get(n) == hub.uid]
+        opts = [discord.SelectOption(
+            label=n, value=n,
+            description=("我的API" if n in hub.state.npc_api else "bot默认API"))
+            for n in mine] or [discord.SelectOption(label="（你没加任何 AI）", value="__none__")]
+        super().__init__(placeholder="选择要移除的 AI…", min_values=1,
+                         max_values=1, options=opts)
+
+    async def callback(self, interaction: discord.Interaction):
+        val = self.values[0]
+        if val == "__none__":
+            await interaction.response.edit_message(content="（你没有可移除的 AI）", view=None)
+            return
+        state = self._hub.state
+        if val in state.chosen_npc_names:
+            state.chosen_npc_names.remove(val)
+        state.npc_api.pop(val, None)
+        state.npc_owner.pop(val, None)
+        await interaction.response.edit_message(content=f"❌ 已移除 AI「{val}」。", view=None)
+        await self._hub.lobby.refresh()
+
+
+class ApiHubView(discord.ui.View):
+    """玩家私有 API + 自助加入 AI 的 ephemeral 面板。每个玩家点开只对自己生效。"""
+
+    def __init__(self, state: GameState, lobby: "LobbyView", uid: int):
+        super().__init__(timeout=300)
+        self.state = state
+        self.lobby = lobby
+        self.uid = uid
+
+    @discord.ui.button(label="添加我的 API 站", style=discord.ButtonStyle.success, emoji="➕")
+    async def add_station(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AddStationModal(self))
+
+    @discord.ui.button(label="我的站（打码）", style=discord.ButtonStyle.secondary, emoji="📋")
+    async def my_stations(self, interaction: discord.Interaction, button: discord.ui.Button):
+        sts = userapi.list_stations(interaction.user.id)
+        if not sts:
+            body = "（你还没有保存任何站。点『➕ 添加我的 API 站』来加。）"
+        else:
+            body = "\n".join(
+                f"{i+1}. **{s.label}** — 模型 `{s.model}`｜key {userapi.mask_key(s.api_key)}"
+                for i, s in enumerate(sts))
+        await interaction.response.send_message(
+            f"🔐 你的私有站（只有你能看到、且 key 已打码）：\n{body}", ephemeral=True)
+
+    @discord.ui.button(label="删除站", style=discord.ButtonStyle.secondary, emoji="🗑")
+    async def del_station(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not userapi.has_stations(interaction.user.id):
+            await interaction.response.send_message("你还没有保存任何站。", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=120)
+        view.add_item(StationRemoveSelect(interaction.user.id))
+        await interaction.response.send_message("选择要删除的站：", view=view, ephemeral=True)
+
+    @discord.ui.button(label="加入 AI 角色", style=discord.ButtonStyle.primary, emoji="🎭")
+    async def add_npc(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not CHARACTER_NPCS:
+            await interaction.response.send_message("目前没有可选的 AI 角色。", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=120)
+        view.add_item(NpcCharSelect(self))
+        await interaction.response.send_message(
+            "① 先选一个 AI 角色，② 再选它用哪个 API：\n"
+            f"· 用 🤖 bot 默认 API：非房主每人最多 {BOT_API_NPC_CAP} 个。\n"
+            "· 用你自己的站：不限个数（想换模型就在『我的站』里存成不同站）。",
+            view=view, ephemeral=True)
+
+    @discord.ui.button(label="移除我加的 AI", style=discord.ButtonStyle.secondary, emoji="❌")
+    async def rm_npc(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = discord.ui.View(timeout=120)
+        view.add_item(MyNpcRemoveSelect(self))
+        await interaction.response.send_message("选择要移除的 AI：", view=view, ephemeral=True)
 
 
 class LobbyView(discord.ui.View):
@@ -1011,9 +1251,12 @@ class LobbyView(discord.ui.View):
         )
         humans = self.state.humans
         chosen = self.state.chosen_npc_names if CHARACTER_NPCS else []
-        # 真人(按加入次序) + 已选 NPC(标 🤖) 排进同一张名单，编号连续
+        # 真人(按加入次序) + 已选 NPC(标 🤖) 排进同一张名单，编号连续。
+        # NPC 后面标 API 来源：🔑=有玩家用自己的 API 带它，否则走 bot 默认。
         rows = [f"{i+1}. {p.mention}" for i, p in enumerate(humans)]
-        rows += [f"{len(humans)+j+1}. 🤖{name}" for j, name in enumerate(chosen)]
+        for j, name in enumerate(chosen):
+            tag = " 🔑自带API" if name in self.state.npc_api else ""
+            rows.append(f"{len(humans)+j+1}. 🤖{name}{tag}")
         roster = "\n".join(rows) if rows else "（还没有人加入）"
         e.add_field(name=f"已加入（{len(humans)} 真人 + {len(chosen)} AI）",
                     value=roster, inline=False)
@@ -1126,6 +1369,17 @@ class LobbyView(discord.ui.View):
             "选中的角色会优先入座，剩余空位用普通 AI 补满。",
             view=view, ephemeral=True,
         )
+
+    @discord.ui.button(label="我的 API / 加 AI", style=discord.ButtonStyle.secondary, emoji="🔧")
+    async def my_api(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.state.phase is not Phase.LOBBY:
+            await interaction.response.send_message("游戏已经开始了。", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "🔧 **我的 API / 加 AI**（只有你能看到，key 私密保存、绝不外显）\n"
+            "· 存好自己的中转站后，可以指定某个 AI 角色用**你的** API（不限个数）。\n"
+            f"· 也可以直接加 AI 用 🤖 bot 默认 API（非房主每人最多 {BOT_API_NPC_CAP} 个）。",
+            view=ApiHubView(self.state, self, interaction.user.id), ephemeral=True)
 
     @discord.ui.button(label="开始游戏", style=discord.ButtonStyle.primary, emoji="▶️")
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1830,13 +2084,20 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
     state.play_channel_id = channel.id
     panel = Panel(channel)
     try:
-        # 1) NPC 补位（补到房主选的桌子人数；真人比这还多则以真人数为准）
-        target = max(state.table_size, len(state.humans))
+        # 1) NPC 补位（补到房主选的桌子人数；真人比这还多则以真人数为准）。
+        #    玩家在大厅显式指定/认领的 AI 一定要坐下，所以桌子至少要容得下「真人+被指定AI」。
+        human_names = {h.name for h in state.humans}
+        chosen_seatable = [n for n in state.chosen_npc_names if n not in human_names]
+        target = max(state.table_size, len(state.humans) + len(chosen_seatable))
         need = target - len(state.players)
         if need > 0:
             existing = {p.name for p in state.players}
             state.players.extend(
                 npc.make_npcs(need, existing, state.chosen_npc_names or None))
+        # 把玩家在大厅给各 NPC 指定的私有 API 站绑到对应 NPC 上（没指定的走默认）
+        for p in state.players:
+            if p.is_npc and p.name in state.npc_api:
+                p.api_profile = state.npc_api[p.name]
         if len(state.players) < 3:
             await channel.send("⚠️ 人数不足（至少 3 人），游戏取消。")
             return

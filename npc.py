@@ -231,7 +231,12 @@ def _extract_json(raw: str) -> dict:
 
 
 def _profile_for(player: Player) -> dict | None:
-    """该角色绑定的站（CHARACTER_API：角色名→站名）；没绑返回 None（走默认站）。"""
+    """该 NPC 本局走哪个站。优先级：
+    1) 玩家在大厅给它指定的私有 API 站（player.api_profile，玩家自带 API）；
+    2) CHARACTER_API 静态绑定（角色名→站名）；
+    3) 都没有 → None（走当前默认站）。"""
+    if getattr(player, "api_profile", None):
+        return player.api_profile
     return llm.profile_by_name(config.CHARACTER_API.get(player.name))
 
 
