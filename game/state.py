@@ -42,11 +42,12 @@ class GameState:
         self.night_deaths: list[Player] = []
         # 房主在大厅指定要加入本局的「角色 NPC」名字（空=不指定，自动补位）
         self.chosen_npc_names: list[str] = []
-        # 每个被指定 NPC 是谁加入的：{NPC名: 加入它的真人 uid}。用于人均上限统计。
+        # 每个被指定 NPC 是谁加入的：{NPC名: 加入它的真人 uid}。用于人均上限统计 / 找配置归属。
         self.npc_owner: dict[str, int] = {}
-        # 玩家给 NPC 指定的私有 API 站：{NPC名: profile dict}。没有=走 bot 默认 API。
-        # profile 形如 {"name","base_url","api_key","model"}。
-        self.npc_api: dict[str, dict] = {}
+        # 玩家给 NPC 指定用自己的哪个私有站：{NPC名: 站名(label)}。没有=走 bot 默认 API。
+        # 只存「归属玩家 uid + 站名」这层引用，真正的 url/key/model 开局时再去 userapi 里解析，
+        # 这样玩家中途编辑/删除站，开局自然用到最新配置。
+        self.npc_station: dict[str, str] = {}
         # 本局桌子人数（房主在大厅选 6 / 12；不足用 AI 补位）
         self.table_size: int = 6
         # 本局板子预设（房主在大厅选；见 roles._PRESETS）。默认 auto，建局时由环境变量覆盖。

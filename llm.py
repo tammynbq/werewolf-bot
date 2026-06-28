@@ -149,6 +149,29 @@ def _extract_content(resp) -> tuple[str, str]:
     return text, finish
 
 
+async def list_models(base_url: str, api_key: str) -> tuple[bool, list[str] | str]:
+    """拉取某个站(url+key)能用的模型清单。成功返回 (True, [模型名...])，
+    失败返回 (False, 人话原因)。顺带也当一次「连通测试」。"""
+    if not api_key:
+        return False, "缺少 api_key"
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url,
+                         timeout=config.LLM_TIMEOUT_SECONDS)
+    try:
+        resp = await asyncio.wait_for(client.models.list(),
+                                      timeout=config.LLM_TIMEOUT_SECONDS)
+        data = getattr(resp, "data", None) or []
+        ids = [getattr(m, "id", None) for m in data]
+        ids = [i for i in ids if i]
+        return True, ids
+    except Exception as exc:
+        return False, explain_error(exc)
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+
 async def health_check_profile(profile: dict) -> tuple[bool, str]:
     """单独测某个站(不切换当前站、用临时 client)。返回 (是否正常, 说明)。"""
     key = profile.get("api_key")
