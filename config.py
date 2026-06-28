@@ -138,6 +138,9 @@ LLM_MIN_INTERVAL_SECONDS: float = _float("WEREWOLF_LLM_MIN_INTERVAL", 2.0)
 LLM_MIN_OUTPUT_TOKENS: int = _int("WEREWOLF_LLM_MIN_OUTPUT_TOKENS", 1500)
 # NPC 发言（LLM）单轮硬时限（秒）：超过就当这名 NPC 本轮沉默、游戏继续，杜绝「发言中」卡死。
 NPC_THINK_SECONDS: int = _int("WEREWOLF_NPC_THINK_SECONDS", 180)
+# 游戏结束后延迟清理的等待时间（秒）：到点自动删除本局狼人专属子区，并清理频道里
+# 残留的狼人杀消息（如大厅面板）。
+CLEANUP_DELAY_SECONDS: int = _int("WEREWOLF_CLEANUP_DELAY_SECONDS", 300)
 
 
 def validate() -> list[str]:
