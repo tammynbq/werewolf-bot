@@ -1571,16 +1571,18 @@ async def phase_wolves(bot, state: GameState, panel: Panel, channel) -> int | No
     return None if kill == 0 else kill
 
 
-async def phase_witch(bot, state: GameState, panel: Panel, kill_uid: int | None) -> dict:
+async def phase_witch(bot, state: GameState, panel: Panel, kill_uid: int | None,
+                      day_log: list[str] | None = None) -> dict:
     """女巫夜晚，返回 {"heal": bool, "poison": uid|None}。"""
     result = {"heal": False, "poison": None}
     witch = state.alive_witch()
     victim = state.get(kill_uid) if kill_uid else None
     title = "🌙 第 %d 夜 · 女巫" % (state.day_count + 1)
 
-    # NPC 女巫先把救/毒决策算好（结果不对外显示，仅写进 result）
+    # NPC 女巫先把救/毒决策算好（结果不对外显示，仅写进 result）。
+    # 传入白天发言记录，让女巫能为「白天被推的恋人」按性格决定是否用毒报复攻击者。
     if witch is not None and witch.is_npc:
-        heal, poison = await npc.witch_night_action(witch, state, kill_uid)
+        heal, poison = await npc.witch_night_action(witch, state, kill_uid, day_log)
         if heal:
             witch.has_heal = False
         if poison is not None:
@@ -2115,7 +2117,7 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
             guard_uid = await phase_guard(bot, state, panel)
             await phase_seer(bot, state, panel)
             kill_uid = await phase_wolves(bot, state, panel, channel)
-            witch_res = await phase_witch(bot, state, panel, kill_uid)
+            witch_res = await phase_witch(bot, state, panel, kill_uid, day_log)
             deaths = state.resolve_night(
                 kill_uid, witch_res["heal"], witch_res["poison"], guard_uid)
 

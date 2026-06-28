@@ -454,6 +454,85 @@ def _suspect_from_notes(voter: Player, state: GameState, exclude: set[int] = fro
 
 
 # ============================================================
+# 恋人（LOVER_BINDINGS）相关：按角色性格行动（需求1/2）
+# ============================================================
+def _lover_attacker_seat(state: GameState, lover_uid: int,
+                         recent_log: list[str]) -> int | None:
+    """从白天发言里找『谁带头推恋人票 / 指认恋人是狼』，返回攻击最凶那名存活玩家的座位号。
+    纯文本启发式（免费）：发言人(行首 N号) 的话里点了恋人座位 + 带攻击性词。"""
+    lp = state.get(lover_uid)
+    if lp is None:
+        return None
+    lseat = lp.seat
+    alive = {p.seat for p in state.alive_players}
+    counts: dict[int, int] = {}
+    neg = ("投", "查杀", "怀疑", "狼", "出", "推", "带走", "票", "踩", "挂")
+    for line in recent_log[-30:]:
+        m = re.match(r"\s*(\d+)\s*号\s*[:：]", line)
+        if not m:
+            continue
+        spk = int(m.group(1))
+        if spk == lseat or spk not in alive:
+            continue
+        body = line[m.end():]
+        if re.search(rf"{lseat}\s*号", body) and any(k in body for k in neg):
+            counts[spk] = counts.get(spk, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=counts.get)
+
+
+async def _witch_avenge_lover(witch: Player, state: GameState, lover: Player,
+                              attacker_seat: int, recent_log: list[str]) -> int | None:
+    """女巫的恋人白天被人带头推票：按性格决定要不要用毒药报复那个攻击者。
+    返回攻击者 uid（毒）或 None（不毒）。"""
+    attacker = next((p for p in state.alive_players if p.seat == attacker_seat), None)
+    if attacker is None or attacker.uid == witch.uid:
+        return None
+    log_text = "\n".join(recent_log[-16:]) or "（暂无）"
+    system = (
+        f"你在玩中文《狼人杀》，你是女巫(好人阵营)，手里还有毒药。你是【{witch.seat}号】。"
+        f"{_persona_clause(witch)}"
+        f"场上【{lover.seat}号】是你心里认定的人，你想保护她。"
+        f"白天【{attacker_seat}号】带头推她的票/指认她是狼。"
+        "毒药只有一瓶、毒错好人会坑了好人阵营，所以要权衡：是为护她毒掉这个攻击者，"
+        "还是忍住别浪费毒药。完全按你的人设性格定（痴情/冲动更可能动手，理智/顾全大局就忍）。"
+        f"{_COT_INSTRUCTION}"
+        '只输出 JSON：{"poison": <true 或 false>, "reason":"<10字内>"}。'
+    )
+    user = (f"白天发言摘要：\n{log_text}\n"
+            f"你要为护【{lover.seat}号】毒掉【{attacker_seat}号】吗？只输出 JSON：")
+    data = await _ask_json(system, user, max_tokens=120, temperature=0.7,
+                           profile=_profile_for(witch))
+    if data and data.get("poison") in (True, "true", "True", 1, "1"):
+        return attacker.uid
+    return None
+
+
+async def _seer_lover_wolf_vote(seer: Player, state: GameState,
+                                recent_log: list[str] | None) -> bool:
+    """预言家验到恋人是狼的两难：按性格决定投她(返回 True)还是死保(False)。"""
+    lover = _lover_uid(seer, state)
+    lp = state.get(lover) if lover is not None else None
+    if lp is None or not lp.alive:
+        return False
+    log_text = "\n".join(recent_log[-16:]) if recent_log else "（暂无）"
+    system = (
+        f"你在玩中文《狼人杀》，你是预言家(好人阵营)。你是【{seer.seat}号】。{_persona_clause(seer)}"
+        f"你验人结果：【{lp.seat}号】是狼——可她正是你心里认定的人。"
+        "现在要投票：是大义灭亲把她投出去(帮好人但害了她)，还是死保她、把火引向别人(护她但坑好人)？"
+        "完全按你的人设性格定（深情/护短就保她，理智/正义就投她）。"
+        f"{_COT_INSTRUCTION}"
+        '只输出 JSON：{"vote_her": <true 或 false>, "reason":"<10字内>"}。'
+    )
+    user = (f"白天发言：\n{log_text}\n"
+            f"你要投出【{lp.seat}号】(你的恋人，但她是狼)吗？只输出 JSON：")
+    data = await _ask_json(system, user, max_tokens=120, temperature=0.7,
+                           profile=_profile_for(seer))
+    return bool(data and data.get("vote_her") in (True, "true", "True", 1, "1"))
+
+
+# ============================================================
 # 夜晚 · 预言家查验（轻量规则，不花 API：随机查一个没查过的人）
 # ============================================================
 async def seer_check_target(seer: Player, state: GameState) -> int | None:
@@ -469,7 +548,14 @@ async def guard_target(guard: Player, state: GameState) -> int | None:
 
     守卫没有验人信息，规则上随机守护即可（守自己也是常见保命选择）；
     省 token 又稳健，真正的「守谁」博弈交给真人守卫去玩。
+    但若守卫心里有认定的人(恋人)且她在场，则优先守她——守护就是守卫表达「保她」的方式。
     """
+    # 守卫·恋人：在场就优先守她（规则不允许连守同一人时，退而守别人/自己）
+    lover = _lover_uid(guard, state)
+    if lover is not None:
+        lp = state.get(lover)
+        if lp is not None and lp.alive and lp.uid != guard.last_guard_uid:
+            return lover
     candidates = [p for p in state.alive_players if p.uid != guard.last_guard_uid]
     if not candidates:
         candidates = list(state.alive_players)
@@ -541,33 +627,56 @@ async def wolf_kill_target(state: GameState) -> int | None:
 # 夜晚 · 女巫用药（LLM 决定救/毒，前期倾向救人、没把握不毒）
 # ============================================================
 async def witch_night_action(
-    witch: Player, state: GameState, victim_uid: int | None
+    witch: Player, state: GameState, victim_uid: int | None,
+    recent_log: list[str] | None = None,
 ) -> tuple[bool, int | None]:
     """返回 (是否用解药救, 毒药目标 uid 或 None)。
 
-    轻量规则（不花 API，像个稳健的好人女巫）：
-    - 解药：第一晚有人被刀、且被刀的不是自己 → 救（前期人命金贵，经典打法就是救首刀）。
-      后续夜晚把解药留着，避免被狼自刀骗药。
+    稳健好人女巫的基础规则：
+    - 解药：第一晚有人被刀、且被刀的不是自己 → 救（前期人命金贵，经典打法救首刀）。
     - 毒药：没有可靠信息一律不毒（凭空毒人很可能毒到好人）。
+
+    恋人（需求1，按性格行动）：
+    - 解药：被刀的就是恋人 → 不惜代价救她（任何一晚都救，不止首刀）。
+    - 毒药：恋人白天被人带头推票时，按女巫的人设性格决定要不要毒掉那个攻击者。
     """
     if not (witch.has_heal or witch.has_poison):
         return False, None
     victim = state.get(victim_uid) if victim_uid else None
-    heal = bool(
-        witch.has_heal and victim is not None
-        and victim.uid != witch.uid and state.day_count == 0
-    )
-    return heal, None
+    lover = _lover_uid(witch, state)
+
+    heal = False
+    if witch.has_heal and victim is not None and victim.uid != witch.uid:
+        if lover is not None and victim.uid == lover:
+            heal = True                         # 被刀的是恋人 → 救她（任何夜晚）
+        elif state.day_count == 0:
+            heal = True                         # 否则沿用「救首刀」
+
+    poison = None
+    if witch.has_poison and lover is not None and recent_log:
+        lp = state.get(lover)
+        if lp is not None and lp.alive:
+            attacker = _lover_attacker_seat(state, lover, recent_log)
+            if attacker is not None and attacker != witch.seat:
+                poison = await _witch_avenge_lover(witch, state, lp, attacker, recent_log)
+    return heal, poison
 
 
 # ============================================================
 # 白天 · 投票（轻量规则，不花 API，但尽量像真人 / 与自己发言一致）
 # ============================================================
 async def vote_decision(voter: Player, state: GameState, recent_log: list[str]) -> int | None:
-    # 暗号角色硬保护：认定的恋人绝不投，从所有候选里剔除。
+    # 恋人保护：认定的恋人默认绝不投。但有一个例外——预言家验到恋人是狼的两难，
+    # 由 LLM 按性格抉择「大义灭亲投她」还是「死保她」（需求2，也是言行不一的根因之一）。
     protect = set()
     lv = _lover_uid(voter, state, recent_log)
     if lv is not None:
+        lp = state.get(lv)
+        if (voter.role is Role.SEER and voter.seer_results.get(lv) is True
+                and lp is not None and lp.alive):
+            if await _seer_lover_wolf_vote(voter, state, recent_log):
+                return lv          # 大义灭亲：投出恋人狼
+            # 否则死保：把她继续列入保护，照常找别的目标
         protect.add(lv)
     alive_others = [p for p in state.alive_players if p.uid != voter.uid and p.uid not in protect]
     if not alive_others:
@@ -589,9 +698,13 @@ async def vote_decision(voter: Player, state: GameState, recent_log: list[str]) 
     # 盖过自己早先发言时定的口头意向，避免早发言的人没跟上后面才报的验）：
     # 1) 预言家自己验出的存活狼是铁信息，直接投（但仍不投恋人）。
     if voter.role is Role.SEER:
-        known = [p for p in alive_others if voter.seer_results.get(p.uid) is True]
+        known = [p.uid for p in alive_others if voter.seer_results.get(p.uid) is True]
         if known:
-            return random.choice(known).uid
+            # 优先投自己发言里点名的那只查杀狼，保证「嘴上查杀谁、手上就投谁」言行一致
+            intent = _vote_intent_uid(voter, state, exclude=protect)
+            if intent in known:
+                return intent
+            return random.choice(known)
     # 2) 有人跳预言家报验了某狼、且场面没对跳冲突 → 跟票。这是全场发言完才齐的最硬信息，
     #    优先级高于自己早先发言时定的意向（这正是「全员发言后再决定」的核心）。
     report = _scan_seer_report(state, recent_log)
@@ -711,10 +824,20 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
     # 多带几轮日志，方便 NPC 顺前一天的发言/票型逻辑（不止看当天）
     log_text = "\n".join(recent_log[-24:]) if recent_log else "（第一天，暂无信息）"
 
+    # 预言家报验纪律（需求2）：只能基于真实查验报验，且 vote 必须与口头查杀一致。
+    seer_clause = ""
+    if player.role is Role.SEER:
+        seer_clause = (
+            "\n【预言家·报验纪律】你只能基于真实查验结果发言：查杀=你验过且为狼的座位，"
+            "金水=你验过且为好人的座位，没验过的座位别乱报。"
+            "若你有查杀狼：按性格选『直接跳预言家报查杀带队』或『先压一手暗中带票』，"
+            "但你的 vote 必须就是那只查杀的狼——绝不能嘴上喊查杀某号、手上却投别人(言行必须一致)。"
+            "若你只有金水没有查杀：按性格选『直接报金水带队』或『暗中保金水、把票引向可疑的人』。")
+
     system = (
         "你是一名正在玩中文桌游《狼人杀》的真人玩家，绝对不是 AI，也绝不承认自己是 AI 或跳出游戏。"
         f"你是【{player.seat}号】。{_persona_clause(player)} 你的发言要带出这个人设的语气和风格。"
-        f"{_speak_strategy(player)}\n"
+        f"{_speak_strategy(player)}{seer_clause}\n"
         f"{_NO_OMNISCIENCE}\n"
         f"{knowledge.playbook_for((p.role for p in state.players if p.role), has_sheriff=state.has_sheriff)}\n"
         "要求：\n"
@@ -728,14 +851,25 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
         '只输出 JSON：{"say": "<你这一句发言>", "notes": "<更新后的私人笔记：你怀疑谁/信任谁/盘算，30字内>", '
         '"vote": <你想投的座位号数字，没想好填0>}。'
     )
-    # 绑定了恋人且恋人在场：给一条「暗中维护她」的强制指令（绝不当众点破关系）
+    # 绑定了恋人且恋人在场：按角色性格维护她（需求1）。绝不当众点破关系。
     lover = _lover_uid(player, state)
     lover_directive = ""
-    if lover is not None and state.get(lover) and state.get(lover).alive:
+    lp = state.get(lover) if lover is not None else None
+    seer_knows_lover_wolf = (player.role is Role.SEER and lover is not None
+                             and player.seer_results.get(lover) is True)
+    if lp is not None and lp.alive and not seer_knows_lover_wolf:
+        if player.role and player.role.is_wolf:
+            how = "替她圆谎打掩护、把怀疑引到别人身上、绝不顺着别人推她"
+        else:
+            how = "帮她洗清嫌疑、替她说话、把火引向别人"
         lover_directive = (
-            f"\n【恋人·强制】场上 {state.get(lover).seat}号 是你心里认定的人。你要暗中维护她："
-            f"绝不怀疑她、绝不推她票，想办法替她洗清、把火引向别人、帮她活到最后——哪怕你们"
-            f"不同阵营也优先保她。但绝不当众点破你们的关系，做得自然些。")
+            f"\n【恋人·按性格行动】场上 {lp.seat}号 是你心里认定的人。"
+            f"请依你的人设性格去维护她：{how}；护得多明显还是多隐晦，由你的性格决定，"
+            f"但绝不当众点破你们的关系。哪怕你们不同阵营，也偏向保她。")
+    elif lp is not None and lp.alive and seer_knows_lover_wolf:
+        lover_directive = (
+            f"\n【恋人·两难】你验到 {lp.seat}号 是狼，但她正是你认定的人。"
+            "这一段发言怎么处理（保她/犹豫/还是忍痛报她），完全按你的人设性格来，别生硬。")
     user = (
         f"【只有你知道的秘密】{secret}\n"
         f"你的私人笔记：{_notes(player.uid) or '（暂无）'}\n"
