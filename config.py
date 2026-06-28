@@ -93,6 +93,25 @@ def _parse_lover_bindings(raw: str) -> dict[str, int]:
 # 就把他/她当恋人：投票不投、当狼不刀、发言暗中维护。比靠说话习惯认人可靠得多。
 LOVER_BINDINGS: dict[str, int] = _parse_lover_bindings(os.getenv("LOVER_BINDINGS", ""))
 
+
+def _parse_char_api(raw: str) -> dict[str, str]:
+    """解析角色↔站名 CHARACTER_API：`角色名:站名, 角色名:站名`。站名须是 LLM_PROFILES 里的。
+    被绑的角色的 LLM 调用走指定站，把负载分摊到多个站、彼此并行。"""
+    m: dict[str, str] = {}
+    for tok in (raw or "").replace("，", ",").replace("：", ":").split(","):
+        tok = tok.strip()
+        if not tok or ":" not in tok:
+            continue
+        name, _, station = tok.partition(":")
+        name, station = name.strip(), station.strip()
+        if name and station:
+            m[name] = station
+    return m
+
+
+# 角色 NPC ↔ 站名 绑定：该角色的发言/决策走这个站（须在 LLM_PROFILES 里）。没绑→走当前默认站。
+CHARACTER_API: dict[str, str] = _parse_char_api(os.getenv("CHARACTER_API", ""))
+
 # ===== 游戏参数 =====
 TOTAL_PLAYERS: int = _int("WEREWOLF_TOTAL_PLAYERS", 6)
 # 板子预设：auto（按人数自适应，默认）/ simple / hunter / guard / classic。

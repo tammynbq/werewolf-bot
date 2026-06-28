@@ -22,10 +22,10 @@ RETRY_BACKOFF_SECONDS = 1.2
 # 撞到 429（限流）时退避得更狠：免费站多半是「每分钟」限流，等久点才有意义。
 RATE_LIMIT_BACKOFF_SECONDS = 8.0
 
-# 全局限速闸门：所有调用先过这道闸——串行 + 强制最小间隔，把瞬时爆发摊平成
-# 细水长流，从源头避免触发中转站的每分钟限流。锁懒初始化（import 期没有事件循环）。
-_gate: asyncio.Lock | None = None
-_last_call_ts: float = 0.0
+# 限速闸门：按「站(base_url)」各自一把锁 + 各自最小间隔。这样不同站的调用可并行，
+# 同一个站内部仍串行限速，从源头避免触发各站的每分钟限流。
+_gates: dict[str, asyncio.Lock] = {}
+_last_ts: dict[str, float] = {}
 
 
 def _is_rate_limit(exc: Exception) -> bool:
@@ -33,17 +33,15 @@ def _is_rate_limit(exc: Exception) -> bool:
     return status == 429 or "RateLimit" in type(exc).__name__
 
 
-async def _throttle() -> None:
-    """串行排队 + 强制最小调用间隔（config.LLM_MIN_INTERVAL_SECONDS）。"""
-    global _gate, _last_call_ts
-    if _gate is None:
-        _gate = asyncio.Lock()
-    async with _gate:
+async def _throttle(key: str) -> None:
+    """按站(key=base_url)串行排队 + 强制最小调用间隔（config.LLM_MIN_INTERVAL_SECONDS）。"""
+    gate = _gates.setdefault(key, asyncio.Lock())
+    async with gate:
         now = asyncio.get_event_loop().time()
-        wait = config.LLM_MIN_INTERVAL_SECONDS - (now - _last_call_ts)
+        wait = config.LLM_MIN_INTERVAL_SECONDS - (now - _last_ts.get(key, 0.0))
         if wait > 0:
             await asyncio.sleep(wait)
-        _last_call_ts = asyncio.get_event_loop().time()
+        _last_ts[key] = asyncio.get_event_loop().time()
 
 
 # ===== 当前在用的「站」（可运行时切换，见 switch_profile / bot 的 /werewolf api）=====
@@ -55,19 +53,29 @@ def _legacy_profile() -> dict:
 
 # 启动时默认用 LLM_PROFILES 的第一个站；没配就用单组环境变量。
 _active: dict = dict(config.LLM_PROFILES[0]) if config.LLM_PROFILES else _legacy_profile()
-# 懒加载单例客户端：切站时置 None 让其按新站重建。
-_client: AsyncOpenAI | None = None
+# 每个站(base_url)一个缓存 client，按需复用，支持多站并行。
+_clients: dict[str, AsyncOpenAI] = {}
 
 
-def _get_client() -> AsyncOpenAI:
-    global _client
-    if _client is None:
-        _client = AsyncOpenAI(
-            api_key=_active.get("api_key") or "missing",
-            base_url=_active.get("base_url"),
-            timeout=config.LLM_TIMEOUT_SECONDS,  # 超时即兜底，避免卡死整局
-        )
-    return _client
+def _client_for(profile: dict) -> AsyncOpenAI:
+    key = profile.get("base_url") or "default"
+    cli = _clients.get(key)
+    if cli is None:
+        cli = AsyncOpenAI(api_key=profile.get("api_key") or "missing",
+                          base_url=profile.get("base_url"),
+                          timeout=config.LLM_TIMEOUT_SECONDS)
+        _clients[key] = cli
+    return cli
+
+
+def profile_by_name(name: str | None) -> dict | None:
+    """按站名找 profile（用于角色绑站 CHARACTER_API）。找不到返回 None。"""
+    if not name:
+        return None
+    for p in config.LLM_PROFILES:
+        if p["name"] == name:
+            return p
+    return None
 
 
 def current_model() -> str:
@@ -84,13 +92,12 @@ def list_profiles() -> list[dict]:
 
 
 def switch_profile(name: str) -> bool:
-    """切到指定站名；成功返回 True 并重建 client，找不到返回 False。"""
-    global _active, _client
+    """切当前默认站；成功返回 True，找不到返回 False。"""
+    global _active
     for p in config.LLM_PROFILES:
         if p["name"] == name:
             _active = dict(p)
-            _client = None  # 下次 _get_client 用新站重建
-            log.info("LLM 已切换到站「%s」(model=%s)", _active["name"], _active["model"])
+            log.info("LLM 默认站已切换到「%s」(model=%s)", _active["name"], _active["model"])
             return True
     return False
 
@@ -174,7 +181,7 @@ async def health_check() -> tuple[bool, str]:
         return False, "当前站缺少 api_key（环境变量没配 OPENAI_API_KEY / LLM_PROFILES）"
     try:
         await asyncio.wait_for(
-            _get_client().chat.completions.create(
+            _client_for(_active).chat.completions.create(
                 model=current_model(),
                 messages=[{"role": "user", "content": "ping"}],
                 max_tokens=1,
@@ -192,24 +199,29 @@ async def chat(
     *,
     temperature: float | None = None,
     max_tokens: int = 220,
+    profile: dict | None = None,
 ) -> str:
     """调用中转站做一次对话补全，返回纯文本。
 
     失败会自动重试 RETRIES 次；全部失败仍不抛异常，返回空字符串，让调用方
     自行决定如何降级（保证一局游戏不会因为 LLM 抽风而崩）。
     """
+    # 角色绑了站就走该站，否则走当前默认站；按站独立限速、可并行。
+    prof = profile or _active
+    key = prof.get("base_url") or "default"
+    model = prof.get("model") or config.MODEL_NAME
     # 给正文留足空间：思考型模型会先吃掉一堆 token，max_tokens 太小会返回空内容。
     effective_max = max(max_tokens, config.LLM_MIN_OUTPUT_TOKENS)
     last_exc: Exception | None = None
     for attempt in range(RETRIES + 1):
-        await _throttle()  # 先过全局限速闸，避免和其他 NPC 调用挤在一起触发限流
+        await _throttle(key)  # 按站限速，避免和同站的其他调用挤在一起触发限流
         hit_rate_limit = False
         try:
             # 用 asyncio.wait_for 再套一层硬时限：思考型模型 + 慢中转站常常不认 SDK 的
             # timeout、能拖很久，这里强制每次调用不超过 LLM_TIMEOUT_SECONDS，超了当失败重试。
             resp = await asyncio.wait_for(
-                _get_client().chat.completions.create(
-                    model=current_model(),
+                _client_for(prof).chat.completions.create(
+                    model=model,
                     messages=[
                         {"role": "system", "content": system},
                         {"role": "user", "content": user},

@@ -230,9 +230,15 @@ def _extract_json(raw: str) -> dict:
             return {}
 
 
+def _profile_for(player: Player) -> dict | None:
+    """该角色绑定的站（CHARACTER_API：角色名→站名）；没绑返回 None（走默认站）。"""
+    return llm.profile_by_name(config.CHARACTER_API.get(player.name))
+
+
 async def _ask_json(system: str, user: str, *, max_tokens: int = 160,
-                    temperature: float | None = None) -> dict:
-    raw = await llm.chat(system, user, max_tokens=max_tokens, temperature=temperature)
+                    temperature: float | None = None, profile: dict | None = None) -> dict:
+    raw = await llm.chat(system, user, max_tokens=max_tokens,
+                         temperature=temperature, profile=profile)
     return _extract_json(raw)
 
 
@@ -392,7 +398,7 @@ async def _decide_target(
         '只输出 JSON：{"target": <座位号数字>, "reason": "<10字内理由>"}，不要任何多余内容。'
     )
     user = f"{task}\n可选目标：{seat_list}。{extra}\n输出 JSON："
-    data = await _ask_json(system, user, max_tokens=120, temperature=temperature)
+    data = await _ask_json(system, user, max_tokens=120, temperature=temperature, profile=_profile_for(player))
     seat = _coerce_seat(data.get("target"), valid_seats)
     if seat is None:
         seat = _parse_seat(json.dumps(data, ensure_ascii=False), valid_seats)
@@ -737,7 +743,7 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
 
     # 先清掉上一轮的投票意向；这次发言解析成功才会重新定下，避免兜底沉默时残留旧意向
     _VOTE_INTENT.pop(player.uid, None)
-    data = await _ask_json(system, user, max_tokens=240, temperature=0.9)
+    data = await _ask_json(system, user, max_tokens=240, temperature=0.9, profile=_profile_for(player))
     if data:
         _set_notes(player.uid, data.get("notes"))
         _set_vote_intent(player.uid, data.get("vote"))  # 让投票跟着这次发言的立场走
@@ -748,7 +754,7 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
             return say
 
     # JSON 没解析出来时，退回到「直接要一句话」的老办法（llm.chat 内部已自带重试）。
-    raw = await llm.chat(system.split("只输出 JSON")[0], user.replace("输出 JSON：", "直接说你这一句发言："))
+    raw = await llm.chat(system.split("只输出 JSON")[0], user.replace("输出 JSON：", "直接说你这一句发言："), profile=_profile_for(player))
     say = _clean_speech(raw, player)
     if len(say) >= 4:
         return say
@@ -784,7 +790,7 @@ async def wolf_chat(player: Player, mates: list[Player], state: GameState) -> st
         f"你心里倾向今晚刀：{plan_txt}（可以据此和队友商量，也可被说服改变）。\n"
         "说一句你和队友商量今晚刀谁的话："
     )
-    raw = await llm.chat(system, user, max_tokens=100, temperature=0.85)
+    raw = await llm.chat(system, user, max_tokens=100, temperature=0.85, profile=_profile_for(player))
     cleaned = _clean_speech(raw, player)
     if len(cleaned) >= 4:
         return cleaned
@@ -810,7 +816,7 @@ async def last_word(player: Player, state: GameState) -> str:
         f"存活玩家：{_alive_roster(state)}。\n"
         f"你（{player.seat}号）刚出局了，留一句遗言："
     )
-    raw = await llm.chat(system, user, max_tokens=120, temperature=0.85)
+    raw = await llm.chat(system, user, max_tokens=120, temperature=0.85, profile=_profile_for(player))
     cleaned = _clean_speech(raw, player)
     if len(cleaned) >= 3:
         return cleaned
@@ -860,7 +866,7 @@ async def sheriff_speech(player: Player, state: GameState, candidates: list[Play
         f"本轮警长候选人：{cand_txt}。\n"
         f"你（{player.seat}号）发表竞选演讲："
     )
-    raw = await llm.chat(system, user, max_tokens=200, temperature=0.85)
+    raw = await llm.chat(system, user, max_tokens=200, temperature=0.85, profile=_profile_for(player))
     cleaned = _clean_speech(raw, player)
     return cleaned if len(cleaned) >= 4 else "我觉得我能带好节奏，大家投我吧。"
 
