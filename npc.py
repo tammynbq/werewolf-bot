@@ -13,6 +13,7 @@ import json
 import random
 import re
 
+import config
 import knowledge
 import llm
 from characters import CHARACTER_NPCS
@@ -57,8 +58,6 @@ _NO_OMNISCIENCE = ("你没有上帝视角：除了【只有你知道的秘密】
                    "私密信息去推理，绝不能说得像你已经知道谁是狼/神/民——那样会立刻穿帮。")
 # 每个 NPC 本轮发言时定下的「想投谁」（uid -> 座位号），让投票跟着发言走、言行一致
 _VOTE_INTENT: dict[int, int] = {}
-# 暗号角色（如崽崽）认定的恋人：崽崽uid -> 恋人uid。认定后粘住，用于硬保护（不投/不刀她）。
-_LOVER: dict[int, int] = {}
 
 
 def _notes(uid: int) -> str:
@@ -109,7 +108,6 @@ def make_npcs(count: int, existing_names: set[str],
     _MEMORY.clear()
     _WOLF_PLAN.clear()
     _VOTE_INTENT.clear()
-    _LOVER.clear()
     npcs: list[Player] = []
     used_names = set(existing_names)
     next_uid = -1
@@ -215,8 +213,12 @@ def _parse_seat(raw: str, valid_seats: dict[int, int]) -> int | None:
 # 规则兜底（LLM 不可用时用，保证流程推进）
 # ============================================================
 def _rule_wolf_kill(state: GameState) -> int | None:
-    # 若某只狼是暗号角色(崽崽)且已认定恋人，硬保护：刀法绕开她。
-    protect = {_LOVER[w.uid] for w in state.alive_wolves() if w.uid in _LOVER}
+    # 若某只狼绑定了恋人且恋人在场，硬保护：刀法绕开她。
+    protect = set()
+    for w in state.alive_wolves():
+        lv = config.LOVER_BINDINGS.get(w.name)
+        if lv is not None and state.get(lv) is not None:
+            protect.add(lv)
     candidates = [p for p in state.alive_villagers() if p.uid not in protect]
     if not candidates:
         candidates = state.alive_villagers()  # 万一只剩恋人可刀，才不护（基本不会）
@@ -612,81 +614,15 @@ def _speak_strategy(player: Player) -> str:
             "若有人跳预言家报验了某人是狼且没人对跳，就明确表态跟他、号召一起投那个狼。")
 
 
-# 暗号机制：人设里埋了暗号的角色（如崽崽），发言时按硬规则收发——但要伪装成正常问话/分析，
-# 别像对暗号。靠强制指令 + 兜底补全，比纯靠 persona 软提示可靠。
-_PASSCODE_MARK = "往哪边吹"
-# 检测「问句」暗号(含伪装说法)：风…吹 / 往哪吹 / 吹去哪 / 哪…吹来 等
-_PASSCODE_RE = re.compile(r"风[^。，,！!？?]{0,12}吹|往哪[^。，,]{0,3}吹|吹[^。，,]{0,4}哪|哪[^。，,]{0,4}吹")
-# 检测「回应」暗号：吹到X
-_COUNTERSIGN_RE = re.compile(r"吹到\S")
-
-
-def _passcode_seen(recent_log: list[str], exclude_seat: int | None = None) -> bool:
-    """场上是否已经有人(可排除自己)抛出过暗号问句(含伪装)。"""
-    for line in recent_log:
-        m = re.match(r"\s*(\d+)\s*号[:：]\s*(.*)", line)
-        if m:
-            if exclude_seat is not None and int(m.group(1)) == exclude_seat:
-                continue  # 跳过自己的发言，免得自问自答
-            if _PASSCODE_RE.search(m.group(2)):
-                return True
-        elif _PASSCODE_RE.search(line):
-            return True
-    return False
-
-
-def _passcode_directive(player: Player, recent_log: list[str]) -> tuple[str, str]:
-    """该 NPC 人设里若埋了暗号，返回(注入提示的强制指令, 模式)；模式 ask/respond/''。"""
-    if _PASSCODE_MARK not in (player.persona or ""):
-        return "", ""
-    if _passcode_seen(recent_log, exclude_seat=player.seat):
-        return ("【暗号·强制】场上已经有人把『风往哪吹』类的话抛出来了——你必须把回应暗号"
-                "『吹到X』(X 是个方向/地名，自己填)**自然地藏进**这句发言里，像顺口接话，"
-                "绝不能让人看出你在对暗号。", "respond")
-    return ("【暗号·强制】目前还没人提过暗号。你要把暗号**伪装成一句针对某位玩家的正常问话/"
-            "分析**塞进发言，绝不能单独突兀地喊『往哪边吹』。例：『4号，你说1号这风到底往哪吹"
-            "的？』『这局的风往哪边吹，2号你品出来没？』——要像在追问/分析，而不是对暗号。", "ask")
-
-
-def _detect_lover(player: Player, state: GameState, recent_log: list[str]) -> int | None:
-    """从发言记录识别暗号角色的恋人：优先『接暗号 吹到X』的人，其次反复用恋人口癖的人。"""
-    seat2uid = {p.seat: p.uid for p in state.players if p.uid != player.uid}
-    tic_counts: dict[int, int] = {}
-    countersign_seat: int | None = None
-    for line in recent_log:
-        m = re.match(r"\s*(\d+)\s*号[:：]\s*(.*)", line)
-        if not m:
-            continue
-        seat, text = int(m.group(1)), m.group(2)
-        if seat not in seat2uid:
-            continue
-        if _COUNTERSIGN_RE.search(text):
-            countersign_seat = seat  # 接暗号是最强信号
-        if (text.startswith("那个") or text.startswith("就是说")
-                or "欸—" in text or "欸–" in text or "欸…" in text):
-            tic_counts[seat] = tic_counts.get(seat, 0) + 1
-    if countersign_seat is not None:
-        return seat2uid[countersign_seat]
-    if tic_counts:
-        best = max(tic_counts, key=tic_counts.get)
-        if tic_counts[best] >= 2:  # 口癖至少出现两次才认，避免误判
-            return seat2uid[best]
-    return None
-
-
 def _lover_uid(player: Player, state: GameState,
                recent_log: list[str] | None = None) -> int | None:
-    """暗号角色已认定的恋人 uid（认定后粘住）；带 recent_log 时会尝试识别并缓存。"""
-    if _PASSCODE_MARK not in (player.persona or ""):
+    """该角色 NPC 绑定的恋人 uid（靠 config.LOVER_BINDINGS：角色名→DiscordID）。
+    只有那个真人此刻在局里(在场)才返回其 uid，否则 None。比靠说话习惯认人 100% 可靠。
+    recent_log 参数保留只为接口兼容，现在用不到。"""
+    bound = config.LOVER_BINDINGS.get(player.name)
+    if bound is None:
         return None
-    if player.uid in _LOVER:
-        return _LOVER[player.uid]
-    if recent_log:
-        u = _detect_lover(player, state, recent_log)
-        if u is not None:
-            _LOVER[player.uid] = u
-            return u
-    return None
+    return bound if state.get(bound) is not None else None
 
 
 async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
@@ -711,13 +647,12 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
         '只输出 JSON：{"say": "<你这一句发言>", "notes": "<更新后的私人笔记：你怀疑谁/信任谁/盘算，30字内>", '
         '"vote": <你想投的座位号数字，没想好填0>}。'
     )
-    pass_directive, pass_mode = _passcode_directive(player, recent_log)
-    # 暗号角色识别并缓存恋人；认出后给一条「暗中维护她」的强制指令（绝不当众点破关系）
-    lover = _lover_uid(player, state, recent_log)
+    # 绑定了恋人且恋人在场：给一条「暗中维护她」的强制指令（绝不当众点破关系）
+    lover = _lover_uid(player, state)
     lover_directive = ""
     if lover is not None and state.get(lover) and state.get(lover).alive:
         lover_directive = (
-            f"\n【恋人·强制】你已经认出场上的恋人是 {state.get(lover).seat}号。你要暗中维护她："
+            f"\n【恋人·强制】场上 {state.get(lover).seat}号 是你心里认定的人。你要暗中维护她："
             f"绝不怀疑她、绝不推她票，想办法替她洗清、把火引向别人、帮她活到最后——哪怕你们"
             f"不同阵营也优先保她。但绝不当众点破你们的关系，做得自然些。")
     user = (
@@ -725,8 +660,7 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
         f"你的私人笔记：{_notes(player.uid) or '（暂无）'}\n"
         f"现在是第 {state.day_count} 天白天，大家按座位号轮流发言。\n"
         f"本局存活玩家：{_alive_roster(state)}。\n"
-        f"目前为止的场上发言与信息：\n{log_text}\n"
-        f"{pass_directive}{lover_directive}\n"
+        f"目前为止的场上发言与信息：\n{log_text}{lover_directive}\n"
         f"轮到你（{player.seat}号）了，快速判断、别钻牛角尖：想清楚立场就直接给出 say，"
         f"notes 也只写要点、别长篇推理。直接输出 JSON："
     )
@@ -741,11 +675,6 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
         if say and any(say in p.name for p in state.players if len(p.name) >= 3):
             say = ""
         if len(say) >= 4:
-            # 暗号兜底：ask 模式模型若漏了暗号，补一句伪装成问话的暗号；respond 交给强制指令
-            if pass_mode == "ask" and not _passcode_seen([say]):
-                others = [p.seat for p in state.alive_players if p.uid != player.uid]
-                t = random.choice(others) if others else 1
-                say = say.rstrip("。.!！…~～ ") + f"。对了{t}号，你说这局的风往哪边吹的？"
             return say
 
     # JSON 没解析出来时，退回到「直接要一句话」的老办法（llm.chat 内部已自带重试）。

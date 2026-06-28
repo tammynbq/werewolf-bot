@@ -70,6 +70,29 @@ LLM_PROFILES: list[dict] = _parse_profiles(os.getenv("LLM_PROFILES", ""))
 # 留空 = 不限制（任何人可切）；填了就只有名单里的人能切。
 LLM_ADMIN_IDS: set[int] = _parse_ids(os.getenv("LLM_ADMIN_IDS", ""))
 
+
+def _parse_lover_bindings(raw: str) -> dict[str, int]:
+    """解析角色↔恋人绑定 LOVER_BINDINGS：`角色名:DiscordID, 角色名:DiscordID`。
+    同一个 DiscordID 可被多个角色绑定（几个角色都把同一玩家当恋人）。"""
+    m: dict[str, int] = {}
+    for tok in (raw or "").replace("，", ",").replace("：", ":").split(","):
+        tok = tok.strip()
+        if not tok or ":" not in tok:
+            continue
+        name, _, idstr = tok.partition(":")
+        name, idstr = name.strip(), idstr.strip()
+        if name:
+            try:
+                m[name] = int(idstr)
+            except ValueError:
+                pass
+    return m
+
+
+# 角色 NPC ↔ 恋人 Discord 用户 ID 的绑定。被绑的角色一旦在局里看到这个真人，
+# 就把他/她当恋人：投票不投、当狼不刀、发言暗中维护。比靠说话习惯认人可靠得多。
+LOVER_BINDINGS: dict[str, int] = _parse_lover_bindings(os.getenv("LOVER_BINDINGS", ""))
+
 # ===== 游戏参数 =====
 TOTAL_PLAYERS: int = _int("WEREWOLF_TOTAL_PLAYERS", 6)
 # 板子预设：auto（按人数自适应，默认）/ simple / hunter / guard / classic。
