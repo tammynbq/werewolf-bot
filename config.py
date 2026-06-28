@@ -36,6 +36,9 @@ DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
 OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 MODEL_NAME: str = os.getenv("MODEL_NAME", "claude-opus-4-8")
+# ====== Supabase ======
+SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
 
 
 def _parse_profiles(raw: str) -> list[dict]:
