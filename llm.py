@@ -137,6 +137,32 @@ def _extract_content(resp) -> tuple[str, str]:
     return text, finish
 
 
+async def health_check_profile(profile: dict) -> tuple[bool, str]:
+    """单独测某个站(不切换当前站、用临时 client)。返回 (是否正常, 说明)。"""
+    key = profile.get("api_key")
+    if not key or key == "missing":
+        return False, "缺少 api_key"
+    client = AsyncOpenAI(api_key=key, base_url=profile.get("base_url"),
+                         timeout=config.LLM_TIMEOUT_SECONDS)
+    try:
+        await asyncio.wait_for(
+            client.chat.completions.create(
+                model=profile.get("model"),
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=1,
+            ),
+            timeout=config.LLM_TIMEOUT_SECONDS,
+        )
+        return True, "ok"
+    except Exception as exc:
+        return False, explain_error(exc)
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+
 async def health_check() -> tuple[bool, str]:
     """自检：打一次最小调用，确认当前站可用。返回 (是否正常, 说明)。"""
     if not _active.get("api_key") or _active.get("api_key") == "missing":
