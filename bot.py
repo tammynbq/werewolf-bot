@@ -26,6 +26,7 @@ import userapi
 from characters import CHARACTER_NPCS
 from game.roles import BOARD_NAMES, Role, summarize_distribution
 from game.state import GameState, Phase, Team
+from database import supabase
 
 logging.basicConfig(
     level=logging.INFO,
