@@ -1010,12 +1010,16 @@ class LobbyView(discord.ui.View):
             color=C_INFO,
         )
         humans = self.state.humans
-        roster = "\n".join(f"{i+1}. {p.mention}" for i, p in enumerate(humans)) if humans else "（还没有人加入）"
-        e.add_field(name=f"已加入玩家（{len(humans)}）", value=roster, inline=False)
-        if CHARACTER_NPCS:
-            chosen = self.state.chosen_npc_names
-            val = "、".join(chosen) if chosen else "（未指定，自动用 AI 角色补位）"
-            e.add_field(name="🎭 指定 AI 角色", value=val, inline=False)
+        chosen = self.state.chosen_npc_names if CHARACTER_NPCS else []
+        # 真人(按加入次序) + 已选 NPC(标 🤖) 排进同一张名单，编号连续
+        rows = [f"{i+1}. {p.mention}" for i, p in enumerate(humans)]
+        rows += [f"{len(humans)+j+1}. 🤖{name}" for j, name in enumerate(chosen)]
+        roster = "\n".join(rows) if rows else "（还没有人加入）"
+        e.add_field(name=f"已加入（{len(humans)} 真人 + {len(chosen)} AI）",
+                    value=roster, inline=False)
+        if CHARACTER_NPCS and not chosen:
+            e.add_field(name="🎭 指定 AI 角色",
+                        value="（未指定，自动用 AI 角色补位）", inline=False)
         e.set_footer(text="房主：可调『6/8/10/12 人』『选板子』『选 AI 角色』，再点『开始游戏』开局")
         return e
 
