@@ -37,6 +37,39 @@ OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 MODEL_NAME: str = os.getenv("MODEL_NAME", "claude-opus-4-8")
 
+
+def _parse_profiles(raw: str) -> list[dict]:
+    """解析多站登记表 LLM_PROFILES：每行一个站 `站名 | base_url | api_key | model`。
+    `#` 开头或空行忽略；字段不全的行跳过。供 /werewolf api 一句话切站用。"""
+    profiles: list[dict] = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) >= 4 and all(parts[:4]):
+            profiles.append({"name": parts[0], "base_url": parts[1],
+                             "api_key": parts[2], "model": parts[3]})
+    return profiles
+
+
+def _parse_ids(raw: str) -> set[int]:
+    ids: set[int] = set()
+    for tok in (raw or "").replace(",", " ").split():
+        try:
+            ids.add(int(tok))
+        except ValueError:
+            pass
+    return ids
+
+
+# 多站登记表：一次性把几个站登记进来，之后 /werewolf api 一句话切换，不用重新部署。
+# 没配则退化为只用上面的单组 OPENAI_BASE_URL/KEY/MODEL_NAME。
+LLM_PROFILES: list[dict] = _parse_profiles(os.getenv("LLM_PROFILES", ""))
+# 允许使用 /werewolf api 切站的 Discord 用户 ID 白名单（逗号/空格分隔）。
+# 留空 = 不限制（任何人可切）；填了就只有名单里的人能切。
+LLM_ADMIN_IDS: set[int] = _parse_ids(os.getenv("LLM_ADMIN_IDS", ""))
+
 # ===== 游戏参数 =====
 TOTAL_PLAYERS: int = _int("WEREWOLF_TOTAL_PLAYERS", 6)
 # 板子预设：auto（按人数自适应，默认）/ simple / hunter / guard / classic。
@@ -67,6 +100,7 @@ def validate() -> list[str]:
     missing = []
     if not DISCORD_TOKEN:
         missing.append("DISCORD_TOKEN")
-    if not OPENAI_API_KEY:
-        missing.append("OPENAI_API_KEY")
+    # 有多站登记表，或有单组 key，二者其一即可
+    if not OPENAI_API_KEY and not LLM_PROFILES:
+        missing.append("OPENAI_API_KEY 或 LLM_PROFILES")
     return missing

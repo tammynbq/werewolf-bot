@@ -45,7 +45,16 @@ async def _throttle() -> None:
         _last_call_ts = asyncio.get_event_loop().time()
 
 
-# 懒加载单例客户端：避免在缺少 key 时一 import 就崩（缺 key 由 config.validate 兜底）。
+# ===== 当前在用的「站」（可运行时切换，见 switch_profile / bot 的 /werewolf api）=====
+def _legacy_profile() -> dict:
+    """没配 LLM_PROFILES 时，退化为单组环境变量这一个站。"""
+    return {"name": "默认(环境变量)", "base_url": config.OPENAI_BASE_URL,
+            "api_key": config.OPENAI_API_KEY or "missing", "model": config.MODEL_NAME}
+
+
+# 启动时默认用 LLM_PROFILES 的第一个站；没配就用单组环境变量。
+_active: dict = dict(config.LLM_PROFILES[0]) if config.LLM_PROFILES else _legacy_profile()
+# 懒加载单例客户端：切站时置 None 让其按新站重建。
 _client: AsyncOpenAI | None = None
 
 
@@ -53,11 +62,36 @@ def _get_client() -> AsyncOpenAI:
     global _client
     if _client is None:
         _client = AsyncOpenAI(
-            api_key=config.OPENAI_API_KEY or "missing",
-            base_url=config.OPENAI_BASE_URL,
+            api_key=_active.get("api_key") or "missing",
+            base_url=_active.get("base_url"),
             timeout=config.LLM_TIMEOUT_SECONDS,  # 超时即兜底，避免卡死整局
         )
     return _client
+
+
+def current_model() -> str:
+    return _active.get("model") or config.MODEL_NAME
+
+
+def active_name() -> str:
+    return _active.get("name", "?")
+
+
+def list_profiles() -> list[dict]:
+    """所有可切换的站（含当前）；没配 PROFILES 时返回单个默认站。"""
+    return list(config.LLM_PROFILES) if config.LLM_PROFILES else [_legacy_profile()]
+
+
+def switch_profile(name: str) -> bool:
+    """切到指定站名；成功返回 True 并重建 client，找不到返回 False。"""
+    global _active, _client
+    for p in config.LLM_PROFILES:
+        if p["name"] == name:
+            _active = dict(p)
+            _client = None  # 下次 _get_client 用新站重建
+            log.info("LLM 已切换到站「%s」(model=%s)", _active["name"], _active["model"])
+            return True
+    return False
 
 
 def explain_error(exc: Exception) -> str:
@@ -104,14 +138,17 @@ def _extract_content(resp) -> tuple[str, str]:
 
 
 async def health_check() -> tuple[bool, str]:
-    """开机自检：打一次最小调用，确认中转站可用。返回 (是否正常, 说明)。"""
-    if not config.OPENAI_API_KEY:
-        return False, "缺少 OPENAI_API_KEY（环境变量没配）"
+    """自检：打一次最小调用，确认当前站可用。返回 (是否正常, 说明)。"""
+    if not _active.get("api_key") or _active.get("api_key") == "missing":
+        return False, "当前站缺少 api_key（环境变量没配 OPENAI_API_KEY / LLM_PROFILES）"
     try:
-        await _get_client().chat.completions.create(
-            model=config.MODEL_NAME,
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=1,
+        await asyncio.wait_for(
+            _get_client().chat.completions.create(
+                model=current_model(),
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=1,
+            ),
+            timeout=config.LLM_TIMEOUT_SECONDS,
         )
         return True, "ok"
     except Exception as exc:
@@ -141,7 +178,7 @@ async def chat(
             # timeout、能拖很久，这里强制每次调用不超过 LLM_TIMEOUT_SECONDS，超了当失败重试。
             resp = await asyncio.wait_for(
                 _get_client().chat.completions.create(
-                    model=config.MODEL_NAME,
+                    model=current_model(),
                     messages=[
                         {"role": "system", "content": system},
                         {"role": "user", "content": user},

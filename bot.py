@@ -2011,6 +2011,55 @@ async def clear(interaction: discord.Interaction, count: int = 100):
     await interaction.followup.send(f"🧹 已清理 {n} 条狼人杀消息。", ephemeral=True)
 
 
+async def _api_station_autocomplete(interaction: discord.Interaction, current: str):
+    return [
+        app_commands.Choice(name=f"{p['name']}（{p['model']}）"[:100], value=p["name"])
+        for p in llm.list_profiles()
+        if current.lower() in p["name"].lower()
+    ][:25]
+
+
+@werewolf.command(name="api", description="查看 / 切换 AI 中转站（可限管理员）")
+@app_commands.describe(station="要切换到的站名；留空则列出所有站和当前在用的")
+@app_commands.autocomplete(station=_api_station_autocomplete)
+async def api_cmd(interaction: discord.Interaction, station: str | None = None):
+    # 权限：配了 LLM_ADMIN_IDS 白名单就只许名单里的人用；没配则不限制
+    if config.LLM_ADMIN_IDS and interaction.user.id not in config.LLM_ADMIN_IDS:
+        await interaction.response.send_message(
+            "🔒 你没有切换 AI 站点的权限。", ephemeral=True)
+        return
+    profiles = llm.list_profiles()
+
+    if station is None:  # 列出所有站 + 当前 + 自检
+        await interaction.response.defer(ephemeral=True)
+        ok, why = await llm.health_check()
+        status = "🟢 连通正常" if ok else f"🔴 {why}"
+        lines = []
+        for p in profiles:
+            mark = "✅" if p["name"] == llm.active_name() else "▫️"
+            lines.append(f"{mark} **{p['name']}**　`{p['model']}`")
+        await interaction.followup.send(
+            f"🔌 **AI 中转站**\n当前在用：**{llm.active_name()}**（{status}）\n\n"
+            + "\n".join(lines)
+            + "\n\n切换：`/werewolf api 站名`（key 不会显示）",
+            ephemeral=True)
+        return
+
+    # 切换到指定站
+    if not llm.switch_profile(station):
+        names = "、".join(p["name"] for p in profiles) or "（未配置任何站）"
+        await interaction.response.send_message(
+            f"❓ 没有叫「{station}」的站。可选：{names}", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    ok, why = await llm.health_check()
+    status = ("🟢 连通正常，NPC 台词将由它生成。"
+              if ok else f"🔴 切过去了，但自检失败：{why}（可再切回别的站）")
+    await interaction.followup.send(
+        f"🔌 已切换到 **{llm.active_name()}**（model `{llm.current_model()}`）\n{status}",
+        ephemeral=True)
+
+
 client.tree.add_command(werewolf)
 
 
