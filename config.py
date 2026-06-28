@@ -36,9 +36,10 @@ DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
 OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 MODEL_NAME: str = os.getenv("MODEL_NAME", "claude-opus-4-8")
-# ====== Supabase ======
-SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
+# ====== 数据库（PostgreSQL，可选）======
+# Railway 加一个 PostgreSQL 后，在 bot 服务里设 DATABASE_URL = ${{Postgres.DATABASE_URL}} 即可。
+# 留空 = 不用数据库、纯内存运行（重启丢数据）。
+DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
 
 def _parse_profiles(raw: str) -> list[dict]:

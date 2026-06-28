@@ -2469,10 +2469,11 @@ async def on_ready():
         log.error("❌ LLM 中转站不可用：%s", detail)
         log.error("   → 此状态下 NPC 会大面积『沉默』。请检查环境变量 "
                   "OPENAI_BASE_URL / OPENAI_API_KEY / MODEL_NAME（Railway 上同名变量）。")
-    # 数据库已启用时，把玩家之前存过的 API 站从 Supabase 读回内存（重启不丢）。
+    # 连接数据库（建表）；连上了就把玩家之前存过的 API 站读回内存（重启不丢）。
+    await database.init()
     if database.enabled:
         n = await userapi.load_from_db()
-        log.info("✅ Supabase 已连接，载回 %d 个玩家的 API 站。", n)
+        log.info("✅ 数据库已连接，载回 %d 个玩家的 API 站。", n)
 
 
 @client.event
