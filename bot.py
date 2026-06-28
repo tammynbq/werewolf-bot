@@ -26,7 +26,7 @@ import userapi
 from characters import CHARACTER_NPCS
 from game.roles import BOARD_NAMES, Role, summarize_distribution
 from game.state import GameState, Phase, Team
-from database import supabase
+import database
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1053,6 +1053,9 @@ class _ManualModelModal(discord.ui.Modal, title="手动填模型名"):
             return
         ok, info = userapi.add_station(
             interaction.user.id, self._label, self._base, self._key, model)
+        if ok:
+            await database.upsert_station(
+                interaction.user.id, info, self._base, self._key, model)
         msg = (f"🟢 测试通过，已私密保存站「{info}」（模型 {model}）。"
                if ok else f"❌ {info}")
         await interaction.followup.send(msg, ephemeral=True)
@@ -1072,6 +1075,9 @@ class _ModelChoiceSelect(discord.ui.Select):
         model = self.values[0]
         ok, info = userapi.add_station(
             interaction.user.id, self._label, self._base, self._key, model)
+        if ok:
+            await database.upsert_station(
+                interaction.user.id, info, self._base, self._key, model)
         msg = (f"🟢 连接正常，已私密保存站「{info}」（模型 {model}）。"
                if ok else f"❌ {info}")
         await interaction.response.edit_message(content=msg, view=None)
@@ -1171,6 +1177,10 @@ class EditStationModal(discord.ui.Modal):
             userapi.add_station(uid, old.label, old.base_url, old.api_key, old.model)
             await interaction.response.send_message(f"❌ {info}（已保留原站不变）", ephemeral=True)
             return
+        # 持久化：删掉旧站名记录、写入新站名（站名可能改了）
+        if info != self._old:
+            await database.delete_station(uid, self._old)
+        await database.upsert_station(uid, info, base, key, model)
         # 同步：本局里凡是该玩家用「旧站名」带的 NPC，改指向新站名
         state = self._hub.state
         for n, l in list(state.npc_station.items()):
@@ -1222,6 +1232,7 @@ class StationActionView(discord.ui.View):
     async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
         uid = interaction.user.id
         userapi.remove_station(uid, self._label)
+        await database.delete_station(uid, self._label)
         # 解绑本局里用这个站带的 NPC（站没了就别让它指空）
         state = self._hub.state
         for n, l in list(state.npc_station.items()):
@@ -2157,6 +2168,30 @@ async def announce_end(channel, panel: Panel, state: GameState) -> None:
     await panel.show(title=title, desc=state.public_roles_reveal(), color=color)
 
 
+async def _save_game_record(state: GameState, day_log: list[str]) -> None:
+    """对局结束后把这局存进数据库供复盘（数据库没启用时自动 no-op）。"""
+    if not database.enabled or state.winner is None:
+        return
+    players = [{
+        "seat": p.seat,
+        "name": p.name,
+        "is_npc": p.is_npc,
+        "discord_id": (None if p.is_npc else str(p.uid)),
+        "role": (p.role.cn if p.role else None),
+        "alive": p.alive,
+        "api_station": state.npc_station.get(p.name),  # 该 NPC 这局用了谁的哪个站
+    } for p in sorted(state.players, key=lambda x: x.seat)]
+    record = {
+        "channel_id": str(state.channel_id),
+        "board": state.board,
+        "table_size": state.table_size,
+        "winner": state.winner.value,
+        "day_count": state.day_count,
+        "record": {"players": players, "log": day_log},
+    }
+    await database.insert_game(record)
+
+
 async def _purge_bot_messages(bot: discord.Client, channel, limit: int = 200) -> int:
     """删除 channel 里 bot 自己发的消息（最近 limit 条），返回删除数量。"""
     def is_mine(m: discord.Message) -> bool:
@@ -2248,6 +2283,7 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
                 break
 
         await announce_end(channel, panel, state)
+        await _save_game_record(state, day_log)
     except Exception:
         log.exception("游戏运行出错")
         await channel.send("❌ 游戏出现内部错误，已结束本局。")
@@ -2433,18 +2469,10 @@ async def on_ready():
         log.error("❌ LLM 中转站不可用：%s", detail)
         log.error("   → 此状态下 NPC 会大面积『沉默』。请检查环境变量 "
                   "OPENAI_BASE_URL / OPENAI_API_KEY / MODEL_NAME（Railway 上同名变量）。")
-      try:
-    result = supabase.table("players").insert({
-        "discord_id": "123456789",
-        "nickname": "測試玩家",
-        "coins": 100
-    }).execute()
-
-    log.info("✅ Supabase 測試成功！")
-    log.info(result)
-
-except Exception as e:
-    log.error("❌ Supabase 測試失敗：%s", e)
+    # 数据库已启用时，把玩家之前存过的 API 站从 Supabase 读回内存（重启不丢）。
+    if database.enabled:
+        n = await userapi.load_from_db()
+        log.info("✅ Supabase 已连接，载回 %d 个玩家的 API 站。", n)
 
 
 @client.event

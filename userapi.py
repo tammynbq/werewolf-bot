@@ -86,3 +86,28 @@ def mask_key(key: str) -> str:
     if len(key) <= 4:
         return "••••"
     return "••••" + key[-4:]
+
+
+async def load_from_db() -> int:
+    """启动时把 Supabase 里存过的 API 站读回内存。返回载入了多少个玩家的数据。
+    数据库没启用时返回 0、什么都不做（fail-soft，见 database.py）。"""
+    import database
+    rows = await database.fetch_all_stations()
+    users: set[int] = set()
+    for r in rows:
+        try:
+            uid = int(r["discord_id"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        base = (r.get("base_url") or "").strip()
+        key = (r.get("api_key") or "").strip()
+        model = (r.get("model") or "").strip()
+        label = (r.get("label") or "").strip() or f"站{len(_STORE.get(uid, [])) + 1}"
+        if not (base and key and model):
+            continue
+        bucket = _STORE.setdefault(uid, [])
+        if any(s.label == label for s in bucket):
+            continue  # 已在内存里（避免重复载入）
+        bucket.append(Station(label, base, key, model))
+        users.add(uid)
+    return len(users)
