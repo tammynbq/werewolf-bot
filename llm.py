@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 from openai import AsyncOpenAI
 
@@ -114,6 +115,9 @@ def explain_error(exc: Exception) -> str:
     return f"{name}: {exc}"
 
 
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
 def _extract_content(resp) -> tuple[str, str]:
     """从补全结果里robustly抠出正文，返回 (正文, finish_reason)。
 
@@ -134,6 +138,7 @@ def _extract_content(resp) -> tuple[str, str]:
             if isinstance(alt, str) and alt.strip():
                 text = alt.strip()
                 break
+    text = _THINK_RE.sub("", text).strip()
     return text, finish
 
 

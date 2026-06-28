@@ -157,12 +157,61 @@ def _persona_clause(player: Player) -> str:
 
 
 # ============================================================
+# 思维链剥离
+# ============================================================
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+_COT_OPENERS = (
+    "let me", "let's", "i'll ", "i will ", "i should", "i need to",
+    "my response", "my reply", "my teammates", "my wolf",
+    "okay,", "alright,", "first,", "analysis:", "thinking:",
+    "plan:", "strategy:", "considering", "breakdown:",
+    "as a wolf", "as the seer", "as the witch", "as the hunter",
+    "as a villager", "as player", "since i am", "since i'm",
+    "我的队友", "我是狼", "我的狼", "分析一下", "让我想想", "让我分析",
+    "我的身份", "作为狼人", "作为预言家", "作为女巫", "作为猎人",
+    "目前局势", "存活的", "已经死",
+)
+
+_COT_INSTRUCTION = (
+    "如果你需要思考，把思考过程放在 <think>...</think> 标签里，标签外只写最终输出。"
+    "绝对不要在你的发言里暴露你的真实身份、队友信息、或任何内心分析过程。"
+)
+
+
+def _strip_cot(text: str) -> str:
+    """剥离模型泄露的思维链：<think> 标签 + 常见 CoT 开头段落。"""
+    text = _THINK_RE.sub("", text).strip()
+    if not text:
+        return text
+    lines = text.splitlines()
+    cleaned: list[str] = []
+    started = False
+    for line in lines:
+        if not started:
+            s = line.strip()
+            if not s:
+                continue
+            low = s.lower()
+            if (
+                s.startswith(("*", "-", "#", ">", "•"))
+                or re.match(r"^\d+\.\s", s)
+                or any(low.startswith(op) for op in _COT_OPENERS)
+            ):
+                continue
+            started = True
+        cleaned.append(line)
+    return "\n".join(cleaned).strip() or text
+
+
+# ============================================================
 # LLM 结构化输出工具
 # ============================================================
 def _extract_json(raw: str) -> dict:
     """从模型回复里抠出第一段 JSON 对象；抠不到返回 {}。"""
     if not raw:
         return {}
+    raw = _strip_cot(raw)
     start = raw.find("{")
     end = raw.rfind("}")
     if start == -1 or end == -1 or end < start:
@@ -339,6 +388,7 @@ async def _decide_target(
         f"你是【{player.seat}号】。{_persona_clause(player)}"
         f"你的私人笔记：{_notes(player.uid) or '（暂无）'}。"
         "请像有脑子的老玩家一样认真推理后再决定，别乱选。"
+        f"{_COT_INSTRUCTION}"
         '只输出 JSON：{"target": <座位号数字>, "reason": "<10字内理由>"}，不要任何多余内容。'
     )
     user = f"{task}\n可选目标：{seat_list}。{extra}\n输出 JSON："
@@ -558,9 +608,10 @@ _META_PREFIXES = (
 
 
 def _clean_speech(text: str, player: Player) -> str:
-    """清洗 LLM 输出：去掉 markdown、自报名字前缀、漏出来的模板痕迹。"""
+    """清洗 LLM 输出：去掉思维链、markdown、自报名字前缀、漏出来的模板痕迹。"""
     if not text:
         return ""
+    text = _strip_cot(text)
     text = text.replace("**", "").replace("```", "").replace("`", "")
     good: list[str] = []
     for line in text.splitlines():
@@ -575,9 +626,25 @@ def _clean_speech(text: str, player: Player) -> str:
     cleaned = re.sub(r"^\s*\d*\s*号?\s*[·.、]?\s*" + re.escape(player.name) + r"\s*[:：]\s*", "", cleaned)
     cleaned = re.sub(r"^\s*\d+\s*号\s*[:：]\s*", "", cleaned)
     cleaned = re.sub(r"^\s*🤖?\s*" + re.escape(player.name) + r"\s*[:：]\s*", "", cleaned)
-    cleaned = cleaned.strip().strip('"“”\'‘’').strip()
+    cleaned = cleaned.strip().strip('"""\'''').strip()
     cleaned = cleaned.lstrip("：:，,。.、/ ").strip()
+    if _leaks_identity(cleaned):
+        return ""
     return cleaned
+
+
+_IDENTITY_LEAK_RE = re.compile(
+    r"我(?:的狼|是狼|的队友是|的身份是)|"
+    r"(?:as (?:a |the )?(?:wolf|werewolf|seer|witch|hunter))|"
+    r"(?:my (?:wolf |werewolf )?teammates?)|"
+    r"(?:i(?:'m| am) (?:a |the )?(?:wolf|werewolf|seer|witch|hunter))",
+    re.IGNORECASE,
+)
+
+
+def _leaks_identity(text: str) -> bool:
+    """检测发言里是否泄露了身份/队友等内部信息。"""
+    return bool(_IDENTITY_LEAK_RE.search(text))
 
 
 # ============================================================
@@ -646,6 +713,7 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
         "4. vote 是你此刻最想投出局谁的座位号：必须和你 say 里的立场一致（说要投谁就填谁），"
         "还没想好就填 0；小心别被悍跳的狼反咬带偏。\n"
         f"5. {_TRANSLATE_RULE}\n"
+        f"{_COT_INSTRUCTION}\n"
         '只输出 JSON：{"say": "<你这一句发言>", "notes": "<更新后的私人笔记：你怀疑谁/信任谁/盘算，30字内>", '
         '"vote": <你想投的座位号数字，没想好填0>}。'
     )
@@ -708,6 +776,7 @@ async def wolf_chat(player: Player, mates: list[Player], state: GameState) -> st
         "你们只知道彼此是狼，并不知道谁是预言家/女巫/平民，只能根据白天的发言去猜，别假装已经知道。"
         "只说 1~2 句、15~45 字；不要加引号、不要写名字前缀、不要 markdown、不要输出 JSON。"
         f"{_TRANSLATE_RULE}"
+        f"{_COT_INSTRUCTION}"
     )
     user = (
         f"你的狼队友：{mate_txt}。\n"
@@ -734,6 +803,7 @@ async def last_word(player: Player, state: GameState) -> str:
         "遗言要贴合身份与性格：好人可以喊话、提醒站边、给信息(预言家可以报验)；狼人可以继续伪装或卖好人。"
         "只说 1~2 句、15~50 字，口语化；不要加引号、不要写名字前缀、不要用 markdown、不要输出 JSON。"
         f"{_TRANSLATE_RULE}"
+        f"{_COT_INSTRUCTION}"
     )
     user = (
         f"【只有你知道的秘密】{secret}\n"
@@ -782,6 +852,7 @@ async def sheriff_speech(player: Player, state: GameState, candidates: list[Play
         "如果你是狼人要伪装成可靠的好人来争取信任。"
         "只说 2~4 句、30~150 字，口语化、有说服力。不要加引号、不要写名字前缀。"
         f"{_TRANSLATE_RULE}"
+        f"{_COT_INSTRUCTION}"
     )
     user = (
         f"【只有你知道的秘密】{secret}\n"
