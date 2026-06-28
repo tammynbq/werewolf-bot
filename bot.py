@@ -2433,6 +2433,18 @@ async def on_ready():
         log.error("❌ LLM 中转站不可用：%s", detail)
         log.error("   → 此状态下 NPC 会大面积『沉默』。请检查环境变量 "
                   "OPENAI_BASE_URL / OPENAI_API_KEY / MODEL_NAME（Railway 上同名变量）。")
+      try:
+    result = supabase.table("players").insert({
+        "discord_id": "123456789",
+        "nickname": "測試玩家",
+        "coins": 100
+    }).execute()
+
+    log.info("✅ Supabase 測試成功！")
+    log.info(result)
+
+except Exception as e:
+    log.error("❌ Supabase 測試失敗：%s", e)
 
 
 @client.event
