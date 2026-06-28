@@ -524,20 +524,22 @@ async def vote_decision(voter: Player, state: GameState, recent_log: list[str]) 
         good = [p for p in alive_others if not (p.role and p.role.is_wolf)]
         return random.choice(good or alive_others).uid
 
-    # 好人阵营：
+    # 好人阵营（投票时按【此刻完整的发言记录】重新判断，让全场发言完才齐的硬信息
+    # 盖过自己早先发言时定的口头意向，避免早发言的人没跟上后面才报的验）：
     # 1) 预言家自己验出的存活狼是铁信息，直接投（但仍不投恋人）。
     if voter.role is Role.SEER:
         known = [p for p in alive_others if voter.seer_results.get(p.uid) is True]
         if known:
             return random.choice(known).uid
-    # 2) 投自己发言里明确表态要投的人——言行一致。
-    intent = _vote_intent_uid(voter, state, exclude=protect)
-    if intent is not None:
-        return intent
-    # 3) 没给明确意向时，才退回启发式：有人跳预言家报验了某狼且场面没对跳冲突 → 跟票。
+    # 2) 有人跳预言家报验了某狼、且场面没对跳冲突 → 跟票。这是全场发言完才齐的最硬信息，
+    #    优先级高于自己早先发言时定的意向（这正是「全员发言后再决定」的核心）。
     report = _scan_seer_report(state, recent_log)
     if report is not None and report != voter.uid and report not in protect:
         return report
+    # 3) 没有可信报验时，才投自己发言里明确表态要投的人——保持言行一致。
+    intent = _vote_intent_uid(voter, state, exclude=protect)
+    if intent is not None:
+        return intent
     # 4) 再不行投自己笔记里最怀疑的人，最后随机。
     suspect = _suspect_from_notes(voter, state, exclude=protect)
     if suspect is not None:
