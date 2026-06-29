@@ -1165,15 +1165,16 @@ class _ManualModelButton(discord.ui.Button):
 
 
 class StationFormModal(discord.ui.Modal):
-    """新增 / 编辑 API 站的统一表单。四个字段一致：站名 / URL / key / 首选模型(可选)。
-    · old_label=None → 新增；非 None → 编辑该站（key 留空=保持原 key）。
-    · 首选模型留空 → 提交后自动拉该站的模型清单让你下拉选（新增、编辑都一样）。"""
+    """新增 / 编辑 API 站的统一表单（文案对齐「API 配置管理器」）。四个字段一致：
+    配置名称 / Custom API URL / Custom API 密钥 / 首选模型(可选)。
+    · old_label=None → 新增；非 None → 编辑该站（密钥留空=保持原 key）。
+    · 首选模型留空 → 提交后自动获取该站的模型清单让你下拉选（新增、编辑都一样）。"""
 
     def __init__(self, hub: "ApiHubView", old_label: str | None = None):
         self._hub = hub
         self._old = old_label
         st = userapi.get_station(hub.uid, old_label) if old_label else None
-        super().__init__(title=(f"编辑站「{old_label}」"[:45] if old_label else "添加我的 API 站"))
+        super().__init__(title=(f"编辑配置「{old_label}」"[:45] if old_label else "API 配置管理器"))
         self.f_label = discord.ui.TextInput(
             label="配置名称（自取，方便你自己区分）", required=False, max_length=20,
             default=(st.label if st else None), placeholder="例如：OpenAI GPT-4")
@@ -1181,7 +1182,7 @@ class StationFormModal(discord.ui.Modal):
             label="Custom API URL（OpenAI 兼容）", required=(st is None),
             default=(st.base_url if st else None), placeholder="例如：https://api.openai.com/v1")
         self.f_key = discord.ui.TextInput(
-            label=("Custom API 密钥（留空=保持原 key）" if st else "Custom API 密钥（只存内存、永不回显明文）"),
+            label=("Custom API 密钥（留空=保持原密钥不变）" if st else "Custom API 密钥（只存内存、永不回显明文）"),
             required=False, placeholder=("不改就留空" if st else "sk-..."))
         self.f_model = discord.ui.TextInput(
             label="首选模型（可选，留空则获取模型列表再选）", required=False,
@@ -1295,7 +1296,7 @@ class StationManageSelect(discord.ui.Select):
 
 class ApiHubView(discord.ui.View):
     """玩家私有 API 面板（ephemeral，每个玩家点开只对自己生效）：只有两个入口——
-    『添加我的 API 站』和『我的站』（编辑/删除/指派给 NPC 都在『我的站』里）。"""
+    『添加配置』和『我的配置』（编辑/删除/指派给 NPC 都在『我的配置』里）。"""
 
     def __init__(self, state: GameState, lobby: "LobbyView", uid: int):
         super().__init__(timeout=300)
@@ -1303,26 +1304,99 @@ class ApiHubView(discord.ui.View):
         self.lobby = lobby
         self.uid = uid
 
-    @discord.ui.button(label="添加我的 API 站", style=discord.ButtonStyle.success, emoji="➕")
+    @discord.ui.button(label="添加配置", style=discord.ButtonStyle.success, emoji="➕")
     async def add_station(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(StationFormModal(self))
 
-    @discord.ui.button(label="我的站", style=discord.ButtonStyle.secondary, emoji="📋")
+    @discord.ui.button(label="我的配置", style=discord.ButtonStyle.secondary, emoji="📋")
     async def my_stations(self, interaction: discord.Interaction, button: discord.ui.Button):
         sts = userapi.list_stations(interaction.user.id)
         if not sts:
             await interaction.response.send_message(
-                "（你还没有保存任何站。点『➕ 添加我的 API 站』来加。）", ephemeral=True)
+                "（你还没有保存任何配置。点『➕ 添加配置』来加。）", ephemeral=True)
             return
         body = "\n".join(
-            f"{i+1}. **{s.label}** — 模型 `{s.model}`｜key {userapi.mask_key(s.api_key)}"
+            f"{i+1}. **{s.label}** — 模型 `{s.model}`｜密钥 {userapi.mask_key(s.api_key)}"
             for i, s in enumerate(sts))
         view = discord.ui.View(timeout=180)
         view.add_item(StationManageSelect(self))
         await interaction.response.send_message(
-            f"🔐 你的私有站（只有你能看到、key 已打码）：\n{body}\n\n"
-            "选一个站可以 ✏️编辑 / 🗑删除 / 🎭指派给某些 AI 角色用：",
+            f"🔐 你的私有配置（只有你能看到、密钥已打码）：\n{body}\n\n"
+            "选一个配置可以 ✏️编辑 / 🗑删除 / 🎭指派给某些 AI 角色用：",
             view=view, ephemeral=True)
+
+
+class RoomSettingsView(discord.ui.View):
+    """房主专用的房间设置子面板：人数 / 板子 / AI 角色，从大厅『房间设置』按钮点开。"""
+
+    def __init__(self, lobby: "LobbyView"):
+        super().__init__(timeout=180)
+        self.lobby = lobby
+
+    @discord.ui.button(label="6/8/10/12 人", style=discord.ButtonStyle.secondary, emoji="👥")
+    async def toggle_size(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = self.lobby.state
+        if interaction.user.id != state.host_id:
+            await interaction.response.send_message("只有房主能调整人数。", ephemeral=True)
+            return
+        if state.phase is not Phase.LOBBY:
+            await interaction.response.send_message("游戏已经开始了。", ephemeral=True)
+            return
+        sizes = [6, 8, 10, 12]
+        cur = state.table_size
+        state.table_size = sizes[(sizes.index(cur) + 1) % len(sizes)] if cur in sizes else 6
+        await interaction.response.send_message(
+            f"👥 本局人数已设为 **{state.table_size} 人**：{summarize_distribution(state.table_size, state.board)}",
+            ephemeral=True,
+        )
+        await self.lobby.refresh()
+
+    @discord.ui.button(label="选板子", style=discord.ButtonStyle.secondary, emoji="🎲")
+    async def cycle_board(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = self.lobby.state
+        if interaction.user.id != state.host_id:
+            await interaction.response.send_message("只有房主能切换板子。", ephemeral=True)
+            return
+        if state.phase is not Phase.LOBBY:
+            await interaction.response.send_message("游戏已经开始了。", ephemeral=True)
+            return
+        # 在各预设之间循环切换
+        order = [
+            "auto", "simple", "hunter", "guard",
+            "idiot", "knight",
+            "hunter_idiot", "hunter_knight", "guard_idiot", "guard_knight",
+            "classic", "classic_idiot", "classic_knight",
+            "wolfking", "wolfking_knight",
+        ]
+        cur = state.board if state.board in order else "auto"
+        state.board = order[(order.index(cur) + 1) % len(order)]
+        await interaction.response.send_message(
+            f"🎲 本局板子已设为 **{BOARD_NAMES.get(state.board, state.board)}**：\n"
+            f"{summarize_distribution(state.table_size, state.board)}",
+            ephemeral=True,
+        )
+        await self.lobby.refresh()
+
+    @discord.ui.button(label="选 AI 角色", style=discord.ButtonStyle.secondary, emoji="🎭")
+    async def pick_npc(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = self.lobby.state
+        if interaction.user.id != state.host_id:
+            await interaction.response.send_message("只有房主能配置 AI 角色。", ephemeral=True)
+            return
+        if state.phase is not Phase.LOBBY:
+            await interaction.response.send_message("游戏已经开始了。", ephemeral=True)
+            return
+        if not CHARACTER_NPCS:
+            await interaction.response.send_message(
+                "目前还没有可选的 AI 角色（characters.py 里没登记）。", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=120)
+        view.add_item(NpcPickSelect(state, self.lobby))
+        await interaction.response.send_message(
+            "挑选要进本局的 AI 角色（可多选；不选则自动补位）。\n"
+            "选中的角色会优先入座，剩余空位用普通 AI 补满。",
+            view=view, ephemeral=True,
+        )
 
 
 class LobbyView(discord.ui.View):
@@ -1342,8 +1416,8 @@ class LobbyView(discord.ui.View):
             title="🐺 狼人杀大厅",
             description=(
                 f"{where}"
-                f"点击 **加入** 入座，房主点 **开始游戏** 即可开局。\n"
-                f"👥 本局人数：**{self.state.table_size} 人**（房主可点『6/8/10/12 人』切换；不足自动 AI 补位）。\n"
+                f"点击 **加入/退出** 入座或离座，房主点 **开始游戏** 即可开局。\n"
+                f"👥 本局人数：**{self.state.table_size} 人**（房主可在『房间设置』里切换；不足自动 AI 补位）。\n"
                 f"⚠️ 本局为**面板模式**：全程在面板上行动，平时频道里不能直接打字，"
                 f"轮到你时点面板按钮发言/行动。\n\n"
                 f"📋 {summarize_distribution(self.state.table_size, self.state.board)}"
@@ -1364,17 +1438,27 @@ class LobbyView(discord.ui.View):
         if CHARACTER_NPCS and not chosen:
             e.add_field(name="🎭 指定 AI 角色",
                         value="（未指定，自动用 AI 角色补位）", inline=False)
-        e.set_footer(text="房主：可调『6/8/10/12 人』『选板子』『选 AI 角色』，再点『开始游戏』开局")
+        e.set_footer(text="房主：点『房间设置』调人数/板子/AI 角色，再点『开始游戏』开局")
         return e
 
     async def refresh(self):
         if self.message:
             await self.message.edit(embed=self.embed(), view=self)
 
-    @discord.ui.button(label="加入", style=discord.ButtonStyle.success, emoji="✅")
-    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="加入/退出", style=discord.ButtonStyle.success, emoji="✅")
+    async def join_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.state.phase is not Phase.LOBBY:
             await interaction.response.send_message("游戏已经开始了。", ephemeral=True)
+            return
+        if any(p.uid == interaction.user.id for p in self.state.humans):
+            self.state.remove_human(interaction.user.id)
+            if self.thread is not None:
+                try:
+                    await self.thread.remove_user(interaction.user)
+                except discord.HTTPException:
+                    pass
+            await interaction.response.send_message("已退出。", ephemeral=True)
+            await self.refresh()
             return
         ok = self.state.add_human(interaction.user.id, interaction.user.display_name)
         if not ok:
@@ -1392,84 +1476,17 @@ class LobbyView(discord.ui.View):
             await interaction.response.send_message("已加入！", ephemeral=True)
         await self.refresh()
 
-    @discord.ui.button(label="退出", style=discord.ButtonStyle.secondary, emoji="🚪")
-    async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.state.phase is not Phase.LOBBY:
-            await interaction.response.send_message("游戏已经开始了。", ephemeral=True)
-            return
-        ok = self.state.remove_human(interaction.user.id)
-        if not ok:
-            await interaction.response.send_message("你不在房间里。", ephemeral=True)
-            return
-        if self.thread is not None:
-            try:
-                await self.thread.remove_user(interaction.user)
-            except discord.HTTPException:
-                pass
-        await interaction.response.send_message("已退出。", ephemeral=True)
-        await self.refresh()
-
-    @discord.ui.button(label="6/8/10/12 人", style=discord.ButtonStyle.secondary, emoji="👥")
-    async def toggle_size(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="房间设置", style=discord.ButtonStyle.secondary, emoji="⚙️")
+    async def room_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.state.host_id:
-            await interaction.response.send_message("只有房主能调整人数。", ephemeral=True)
+            await interaction.response.send_message("只有房主能调整房间设置。", ephemeral=True)
             return
         if self.state.phase is not Phase.LOBBY:
             await interaction.response.send_message("游戏已经开始了。", ephemeral=True)
             return
-        sizes = [6, 8, 10, 12]
-        cur = self.state.table_size
-        self.state.table_size = sizes[(sizes.index(cur) + 1) % len(sizes)] if cur in sizes else 6
         await interaction.response.send_message(
-            f"👥 本局人数已设为 **{self.state.table_size} 人**：{summarize_distribution(self.state.table_size, self.state.board)}",
-            ephemeral=True,
-        )
-        await self.refresh()
-
-    @discord.ui.button(label="选板子", style=discord.ButtonStyle.secondary, emoji="🎲")
-    async def cycle_board(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.state.host_id:
-            await interaction.response.send_message("只有房主能切换板子。", ephemeral=True)
-            return
-        if self.state.phase is not Phase.LOBBY:
-            await interaction.response.send_message("游戏已经开始了。", ephemeral=True)
-            return
-        # 在各预设之间循环切换
-        order = [
-            "auto", "simple", "hunter", "guard",
-            "idiot", "knight",
-            "hunter_idiot", "hunter_knight", "guard_idiot", "guard_knight",
-            "classic", "classic_idiot", "classic_knight",
-            "wolfking", "wolfking_knight",
-        ]
-        cur = self.state.board if self.state.board in order else "auto"
-        self.state.board = order[(order.index(cur) + 1) % len(order)]
-        await interaction.response.send_message(
-            f"🎲 本局板子已设为 **{BOARD_NAMES.get(self.state.board, self.state.board)}**：\n"
-            f"{summarize_distribution(self.state.table_size, self.state.board)}",
-            ephemeral=True,
-        )
-        await self.refresh()
-
-    @discord.ui.button(label="选 AI 角色", style=discord.ButtonStyle.secondary, emoji="🎭")
-    async def pick_npc(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.state.host_id:
-            await interaction.response.send_message("只有房主能配置 AI 角色。", ephemeral=True)
-            return
-        if self.state.phase is not Phase.LOBBY:
-            await interaction.response.send_message("游戏已经开始了。", ephemeral=True)
-            return
-        if not CHARACTER_NPCS:
-            await interaction.response.send_message(
-                "目前还没有可选的 AI 角色（characters.py 里没登记）。", ephemeral=True)
-            return
-        view = discord.ui.View(timeout=120)
-        view.add_item(NpcPickSelect(self.state, self))
-        await interaction.response.send_message(
-            "挑选要进本局的 AI 角色（可多选；不选则自动补位）。\n"
-            "选中的角色会优先入座，剩余空位用普通 AI 补满。",
-            view=view, ephemeral=True,
-        )
+            "⚙️ **房间设置**（人数 / 板子 / AI 角色，只有房主能点）：",
+            view=RoomSettingsView(self), ephemeral=True)
 
     @discord.ui.button(label="我的 API", style=discord.ButtonStyle.secondary, emoji="🔧")
     async def my_api(self, interaction: discord.Interaction, button: discord.ui.Button):
