@@ -1032,163 +1032,178 @@ def _assign_station_to_npcs(state: GameState, uid: int, label: str,
         state.npc_station[n] = label
 
 
+# ----- 新增 / 编辑 共用的保存 & 「拉模型→选」流程 -----
+async def _persist_station(hub: "ApiHubView", uid: int, *, old_label: str | None,
+                           label: str, base: str, key: str, model: str) -> tuple[bool, str]:
+    """真正写入一个站（内存 + 数据库）。old_label=None 表示新增；非 None 表示编辑（可能改名）。
+    不碰 interaction，只做数据。返回 (是否成功, 最终站名/错误说明)。"""
+    state = hub.state
+    if old_label is not None:
+        old = userapi.get_station(uid, old_label)
+        userapi.remove_station(uid, old_label)
+        ok, info = userapi.add_station(uid, label, base, key, model)
+        if not ok:
+            if old:  # 改失败（多半重名）→ 把旧的原样加回去，别弄丢
+                userapi.add_station(uid, old.label, old.base_url, old.api_key, old.model)
+            return False, info
+        if info != old_label:
+            await database.delete_station(uid, old_label)
+        await database.upsert_station(uid, info, base, key, model)
+        # 本局里凡是该玩家用「旧站名」带的 NPC，改指向新站名
+        for n, l in list(state.npc_station.items()):
+            if l == old_label and state.npc_owner.get(n) == uid:
+                state.npc_station[n] = info
+        await hub.lobby.refresh()
+        return True, info
+    ok, info = userapi.add_station(uid, label, base, key, model)
+    if ok:
+        await database.upsert_station(uid, info, base, key, model)
+    return ok, info
+
+
+async def _finalize_station(interaction: discord.Interaction, hub: "ApiHubView", *,
+                            old_label: str | None, label: str, base: str,
+                            key: str, model: str) -> None:
+    """新增/编辑提交后的统一收尾（interaction 尚未 response）：
+    · 填了模型 → 用它测连通，过了就保存；
+    · 没填模型 → 拉该站可用模型清单让你下拉选（或手动填）。"""
+    if model:
+        await interaction.response.send_message(
+            f"⏳ 正在用模型「{model}」测试连接…", ephemeral=True)
+        good, why = await llm.health_check_profile(
+            {"name": label or "站", "base_url": base, "api_key": key, "model": model})
+        if not good:
+            await interaction.followup.send(
+                f"🔴 测试失败：{why}\n（没有保存，请检查 url/key/模型名后重试）", ephemeral=True)
+            return
+        ok, info = await _persist_station(hub, interaction.user.id, old_label=old_label,
+                                          label=label, base=base, key=key, model=model)
+        await interaction.followup.send(
+            (f"🟢 已保存站「{info}」（模型 {model}）。" if ok else f"❌ {info}"), ephemeral=True)
+        return
+    # 没填模型 → 拉清单来选（拉清单本身也是一次连通测试）
+    await interaction.response.send_message("⏳ 正在拉取该站可用的模型…", ephemeral=True)
+    okm, result = await llm.list_models(base, key)
+    view = discord.ui.View(timeout=180)
+    if okm and isinstance(result, list) and result:
+        view.add_item(_ModelChoiceSelect(hub, old_label, label, base, key, result))
+        view.add_item(_ManualModelButton(hub, old_label, label, base, key))
+        await interaction.followup.send(
+            f"🟢 连接成功，拉到 {len(result)} 个模型。选一个要用的（或手动填）：",
+            view=view, ephemeral=True)
+    elif okm:
+        view.add_item(_ManualModelButton(hub, old_label, label, base, key))
+        await interaction.followup.send(
+            "🟡 连得上，但这个站没有返回可用模型清单。点下面手动填模型名（会再测一次连通）：",
+            view=view, ephemeral=True)
+    else:
+        view.add_item(_ManualModelButton(hub, old_label, label, base, key))
+        await interaction.followup.send(
+            f"🔴 拉取模型失败：{result}\n可点下面手动填模型名再测一次连通：",
+            view=view, ephemeral=True)
+
+
 class _ManualModelModal(discord.ui.Modal, title="手动填模型名"):
     """站子不返回模型清单时，手动填一个模型名，并用它做一次真正的连通测试，过了才存。"""
     f_model = discord.ui.TextInput(label="模型名", placeholder="如 gemini-2.0-flash")
 
-    def __init__(self, hub: "ApiHubView", label: str, base: str, key: str):
+    def __init__(self, hub: "ApiHubView", old_label: str | None,
+                 label: str, base: str, key: str):
         super().__init__()
-        self._hub, self._label, self._base, self._key = hub, label, base, key
+        self._hub, self._old = hub, old_label
+        self._label, self._base, self._key = label, base, key
 
     async def on_submit(self, interaction: discord.Interaction):
         model = str(self.f_model).strip()
         await interaction.response.send_message(
             f"⏳ 正在用模型「{model}」测试连接…", ephemeral=True)
-        profile = {"name": self._label, "base_url": self._base,
-                   "api_key": self._key, "model": model}
-        good, why = await llm.health_check_profile(profile)
+        good, why = await llm.health_check_profile(
+            {"name": self._label or "站", "base_url": self._base,
+             "api_key": self._key, "model": model})
         if not good:
             await interaction.followup.send(
                 f"🔴 测试失败：{why}\n（没有保存，请检查 url/key/模型名后重试）", ephemeral=True)
             return
-        ok, info = userapi.add_station(
-            interaction.user.id, self._label, self._base, self._key, model)
-        if ok:
-            await database.upsert_station(
-                interaction.user.id, info, self._base, self._key, model)
-        msg = (f"🟢 测试通过，已私密保存站「{info}」（模型 {model}）。"
-               if ok else f"❌ {info}")
-        await interaction.followup.send(msg, ephemeral=True)
+        ok, info = await _persist_station(self._hub, interaction.user.id, old_label=self._old,
+                                          label=self._label, base=self._base,
+                                          key=self._key, model=model)
+        await interaction.followup.send(
+            (f"🟢 测试通过，已保存站「{info}」（模型 {model}）。" if ok else f"❌ {info}"),
+            ephemeral=True)
 
 
 class _ModelChoiceSelect(discord.ui.Select):
     """从该站拉到的模型清单里选一个，选定即保存（拉清单本身已经是连通测试）。"""
 
-    def __init__(self, hub: "ApiHubView", label: str, base: str, key: str,
-                 models: list[str]):
-        self._hub, self._label, self._base, self._key = hub, label, base, key
+    def __init__(self, hub: "ApiHubView", old_label: str | None,
+                 label: str, base: str, key: str, models: list[str]):
+        self._hub, self._old = hub, old_label
+        self._label, self._base, self._key = label, base, key
         opts = [discord.SelectOption(label=m[:100], value=m[:100]) for m in models[:25]]
         super().__init__(placeholder="选择该站要用的模型…", min_values=1,
                          max_values=1, options=opts)
 
     async def callback(self, interaction: discord.Interaction):
         model = self.values[0]
-        ok, info = userapi.add_station(
-            interaction.user.id, self._label, self._base, self._key, model)
-        if ok:
-            await database.upsert_station(
-                interaction.user.id, info, self._base, self._key, model)
-        msg = (f"🟢 连接正常，已私密保存站「{info}」（模型 {model}）。"
-               if ok else f"❌ {info}")
+        ok, info = await _persist_station(self._hub, interaction.user.id, old_label=self._old,
+                                          label=self._label, base=self._base,
+                                          key=self._key, model=model)
+        msg = (f"🟢 连接正常，已保存站「{info}」（模型 {model}）。" if ok else f"❌ {info}")
         await interaction.response.edit_message(content=msg, view=None)
 
 
 class _ManualModelButton(discord.ui.Button):
-    def __init__(self, hub: "ApiHubView", label: str, base: str, key: str):
+    def __init__(self, hub: "ApiHubView", old_label: str | None,
+                 label: str, base: str, key: str):
         super().__init__(label="手动填模型名", style=discord.ButtonStyle.secondary, emoji="✏️")
-        self._hub, self._label, self._base, self._key = hub, label, base, key
+        self._hub, self._old = hub, old_label
+        self._label, self._base, self._key = label, base, key
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(
-            _ManualModelModal(self._hub, self._label, self._base, self._key))
+            _ManualModelModal(self._hub, self._old, self._label, self._base, self._key))
 
 
-class AddStationModal(discord.ui.Modal, title="添加我的 API 站（私密保存）"):
-    """只填 站名/url/key；提交后自动拉「该 url+key 可用的模型」并完成连通测试，选模型才保存。"""
-    f_label = discord.ui.TextInput(
-        label="站名（自取，方便你自己区分）", required=False,
-        placeholder="如：我的Gemini / 备用站", max_length=20)
-    f_base = discord.ui.TextInput(
-        label="base_url（OpenAI 兼容，通常以 /v1 结尾）",
-        placeholder="https://xxx.com/v1")
-    f_key = discord.ui.TextInput(
-        label="API key（只存内存、永不回显明文）", placeholder="sk-...")
+class StationFormModal(discord.ui.Modal):
+    """新增 / 编辑 API 站的统一表单。四个字段一致：站名 / URL / key / 首选模型(可选)。
+    · old_label=None → 新增；非 None → 编辑该站（key 留空=保持原 key）。
+    · 首选模型留空 → 提交后自动拉该站的模型清单让你下拉选（新增、编辑都一样）。"""
 
-    def __init__(self, hub: "ApiHubView"):
-        super().__init__()
-        self._hub = hub
-
-    async def on_submit(self, interaction: discord.Interaction):
-        label = str(self.f_label).strip()
-        base = str(self.f_base).strip()
-        key = str(self.f_key).strip()
-        if not base or not key:
-            await interaction.response.send_message("❌ base_url 和 key 都不能为空。", ephemeral=True)
-            return
-        await interaction.response.send_message(
-            "⏳ 正在测试连接并拉取该站可用的模型…", ephemeral=True)
-        ok, result = await llm.list_models(base, key)
-        view = discord.ui.View(timeout=180)
-        if ok and isinstance(result, list) and result:
-            view.add_item(_ModelChoiceSelect(self._hub, label, base, key, result))
-            view.add_item(_ManualModelButton(self._hub, label, base, key))
-            await interaction.followup.send(
-                f"🟢 连接成功，拉到 {len(result)} 个模型。选一个要用的（或手动填）：",
-                view=view, ephemeral=True)
-        elif ok:
-            # 连得上但该站不返回模型清单：让用户手动填模型名，再做一次 chat 连通测试
-            view.add_item(_ManualModelButton(self._hub, label, base, key))
-            await interaction.followup.send(
-                "🟡 连得上，但这个站没有返回可用模型清单。点下面手动填模型名（会再测一次连通）：",
-                view=view, ephemeral=True)
-        else:
-            # 连不上：仍允许手动填模型名重试一次（有些站 /models 不通但 /chat 通）
-            view.add_item(_ManualModelButton(self._hub, label, base, key))
-            await interaction.followup.send(
-                f"🔴 拉取模型失败：{result}\n可点下面手动填模型名再测一次连通：",
-                view=view, ephemeral=True)
-
-
-class EditStationModal(discord.ui.Modal):
-    """编辑已存在的站：预填 站名/url/模型；key 留空=保持原 key（绝不回显明文）。"""
-
-    def __init__(self, hub: "ApiHubView", old_label: str):
-        super().__init__(title=f"编辑站「{old_label}」"[:45])
+    def __init__(self, hub: "ApiHubView", old_label: str | None = None):
         self._hub = hub
         self._old = old_label
-        st = userapi.get_station(hub.uid, old_label)
+        st = userapi.get_station(hub.uid, old_label) if old_label else None
+        super().__init__(title=(f"编辑站「{old_label}」"[:45] if old_label else "添加我的 API 站"))
         self.f_label = discord.ui.TextInput(
-            label="站名", default=(st.label if st else old_label),
-            required=False, max_length=20)
+            label="配置名称（自取，方便你自己区分）", required=False, max_length=20,
+            default=(st.label if st else None), placeholder="例如：OpenAI GPT-4")
         self.f_base = discord.ui.TextInput(
-            label="base_url", default=(st.base_url if st else ""))
+            label="Custom API URL（OpenAI 兼容）", required=(st is None),
+            default=(st.base_url if st else None), placeholder="例如：https://api.openai.com/v1")
         self.f_key = discord.ui.TextInput(
-            label="API key（留空=保持原 key 不变）", required=False,
-            placeholder="不改就留空")
+            label=("Custom API 密钥（留空=保持原 key）" if st else "Custom API 密钥（只存内存、永不回显明文）"),
+            required=False, placeholder=("不改就留空" if st else "sk-..."))
         self.f_model = discord.ui.TextInput(
-            label="模型名", default=(st.model if st else ""))
+            label="首选模型（可选，留空则获取模型列表再选）", required=False,
+            default=(st.model if st else None), placeholder="例如：gpt-4")
         for it in (self.f_label, self.f_base, self.f_key, self.f_model):
             self.add_item(it)
 
     async def on_submit(self, interaction: discord.Interaction):
         uid = interaction.user.id
-        old = userapi.get_station(uid, self._old)
-        if old is None:
+        old = userapi.get_station(uid, self._old) if self._old else None
+        if self._old and old is None:
             await interaction.response.send_message("❌ 这个站已经不存在了。", ephemeral=True)
             return
-        label = str(self.f_label).strip() or old.label
-        base = str(self.f_base).strip() or old.base_url
-        key = str(self.f_key).strip() or old.api_key      # 留空=沿用原 key
-        model = str(self.f_model).strip() or old.model
-        userapi.remove_station(uid, self._old)
-        ok, info = userapi.add_station(uid, label, base, key, model)
-        if not ok:
-            # 改失败（多半是重名）→ 把旧的原样加回去，别弄丢
-            userapi.add_station(uid, old.label, old.base_url, old.api_key, old.model)
-            await interaction.response.send_message(f"❌ {info}（已保留原站不变）", ephemeral=True)
+        label = str(self.f_label).strip() or (old.label if old else "")
+        base = str(self.f_base).strip() or (old.base_url if old else "")
+        key = str(self.f_key).strip() or (old.api_key if old else "")  # 编辑时留空=沿用原 key
+        model = str(self.f_model).strip()  # 留空 → 由 _finalize_station 去拉清单来选
+        if not base or not key:
+            await interaction.response.send_message("❌ Custom API URL 和密钥都不能为空。", ephemeral=True)
             return
-        # 持久化：删掉旧站名记录、写入新站名（站名可能改了）
-        if info != self._old:
-            await database.delete_station(uid, self._old)
-        await database.upsert_station(uid, info, base, key, model)
-        # 同步：本局里凡是该玩家用「旧站名」带的 NPC，改指向新站名
-        state = self._hub.state
-        for n, l in list(state.npc_station.items()):
-            if l == self._old and state.npc_owner.get(n) == uid:
-                state.npc_station[n] = info
-        await interaction.response.send_message(
-            f"✅ 已更新站「{info}」（模型 {model}）。", ephemeral=True)
-        await self._hub.lobby.refresh()
+        await _finalize_station(interaction, self._hub, old_label=self._old,
+                                label=label, base=base, key=key, model=model)
 
 
 class AssignStationNpcSelect(discord.ui.Select):
@@ -1226,7 +1241,7 @@ class StationActionView(discord.ui.View):
 
     @discord.ui.button(label="编辑", style=discord.ButtonStyle.primary, emoji="✏️")
     async def edit(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(EditStationModal(self._hub, self._label))
+        await interaction.response.send_modal(StationFormModal(self._hub, self._label))
 
     @discord.ui.button(label="删除", style=discord.ButtonStyle.danger, emoji="🗑")
     async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1290,7 +1305,7 @@ class ApiHubView(discord.ui.View):
 
     @discord.ui.button(label="添加我的 API 站", style=discord.ButtonStyle.success, emoji="➕")
     async def add_station(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(AddStationModal(self))
+        await interaction.response.send_modal(StationFormModal(self))
 
     @discord.ui.button(label="我的站", style=discord.ButtonStyle.secondary, emoji="📋")
     async def my_stations(self, interaction: discord.Interaction, button: discord.ui.Button):
