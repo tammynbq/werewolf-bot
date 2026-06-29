@@ -54,6 +54,10 @@ class GameState:
         self.board: str = "auto"
         # 警长 uid（classic 板有警长竞选；None = 没有警长或还没选出来）
         self.sheriff_uid: int | None = None
+        # 测试模式：开局时指定某些座位的角色（{座位号: Role}）
+        self.fixed_roles: dict[int, "Role"] | None = None
+        # 夜晚行动详细记录（复盘用）：每晚一条 dict
+        self.night_actions: list[dict] = []
 
     # ---------- 玩家管理 ----------
     def get(self, uid: int) -> Player | None:
@@ -122,18 +126,41 @@ class GameState:
         self.sheriff_uid = None
 
     # ---------- 开局 ----------
-    def assign_roles(self, board: str = "auto") -> None:
-        """打乱并分配角色与座位号。board 指定板子预设（见 roles._PRESETS）。"""
+    def assign_roles(self, board: str = "auto",
+                     fixed_roles: dict[int, Role] | None = None) -> None:
+        """打乱并分配角色与座位号。board 指定板子预设（见 roles._PRESETS）。
+
+        fixed_roles: 测试模式用——{座位号: Role}，指定某些座位的角色，其余随机。
+        """
         # 先打乱玩家列表，使座位号、发言顺序都与「加入顺序」无关，
         # 避免有人对照大厅入座名单反推出某号是谁（保证匿名不被解码）。
         random.shuffle(self.players)
-        roles = role_distribution(len(self.players), board)
-        random.shuffle(roles)
-        for player, role in zip(self.players, roles):
-            player.role = role
         # 在打乱后的顺序上分配 1-based 座位号
         for i, player in enumerate(self.players, start=1):
             player.seat = i
+
+        if fixed_roles:
+            roles = role_distribution(len(self.players), board)
+            random.shuffle(roles)
+            used: list[Role] = []
+            for seat, role in fixed_roles.items():
+                p = next((p for p in self.players if p.seat == seat), None)
+                if p is not None:
+                    p.role = role
+                    used.append(role)
+            remaining_roles = list(roles)
+            for r in used:
+                if r in remaining_roles:
+                    remaining_roles.remove(r)
+            unassigned = [p for p in self.players if p.role is None]
+            random.shuffle(remaining_roles)
+            for player, role in zip(unassigned, remaining_roles):
+                player.role = role
+        else:
+            roles = role_distribution(len(self.players), board)
+            random.shuffle(roles)
+            for player, role in zip(self.players, roles):
+                player.role = role
         self.phase = Phase.NIGHT
         self.day_count = 0
 
@@ -221,6 +248,121 @@ class GameState:
             return None
         self.phase = Phase.ENDED
         return self.winner
+
+    def record_night_action(self, night: int, *,
+                            guard_uid: int | None = None,
+                            seer_uid: int | None = None,
+                            seer_target: int | None = None,
+                            seer_result: bool | None = None,
+                            wolf_kill: int | None = None,
+                            witch_heal: bool = False,
+                            witch_poison: int | None = None,
+                            deaths: list["Player"] | None = None) -> None:
+        """记录一晚的所有行动（复盘用）。"""
+        action: dict = {"night": night}
+        if guard_uid is not None:
+            g = self.get(guard_uid)
+            action["guard"] = f"守卫守护了{g.seat}号" if g else None
+        if seer_uid is not None and seer_target is not None:
+            st = self.get(seer_target)
+            verdict = "狼人" if seer_result else "好人"
+            action["seer"] = f"预言家({self.get(seer_uid).seat}号)查验了{st.seat}号→{verdict}" if st else None
+        if wolf_kill is not None:
+            wt = self.get(wolf_kill)
+            action["wolf"] = f"狼人刀了{wt.seat}号" if wt else None
+        else:
+            action["wolf"] = "狼人空刀"
+        if witch_heal:
+            action["witch_heal"] = "女巫用了解药"
+        if witch_poison is not None:
+            wp = self.get(witch_poison)
+            action["witch_poison"] = f"女巫毒了{wp.seat}号" if wp else None
+        if deaths is not None:
+            if deaths:
+                action["result"] = "死亡：" + "、".join(f"{d.seat}号" for d in deaths)
+            else:
+                action["result"] = "平安夜"
+        self.night_actions.append(action)
+
+    def format_review(self, day_log: list[str]) -> str:
+        """生成赛后复盘报告。"""
+        import re as _re
+        lines: list[str] = []
+        lines.append("========== 赛后复盘 ==========")
+        lines.append("")
+
+        # 身份揭晓
+        lines.append("[身份一览]")
+        for p in sorted(self.players, key=lambda x: x.seat):
+            status = "存活" if p.alive else "出局"
+            role = p.role.cn if p.role else "?"
+            tag = "(AI)" if p.is_npc else "(玩家)"
+            lines.append(f"  {p.seat}号 {role} {tag}{p.name} -- {status}")
+        lines.append("")
+
+        # 按回合组织：夜晚行动 + 白天记录交替展示
+        max_day = self.day_count or 1
+
+        # 先把 day_log 里的条目按天分组
+        day_groups: dict[int, list[str]] = {}
+        current_day = 0
+        for entry in day_log:
+            m = _re.match(r"第(\d+)晚", entry)
+            if m:
+                current_day = int(m.group(1))
+                continue
+            if current_day not in day_groups:
+                day_groups[current_day] = []
+            day_groups[current_day].append(entry)
+
+        # 按 night_actions 的索引和对应的白天记录交替展示
+        for action in self.night_actions:
+            night = action.get("night", "?")
+            lines.append(f"[第{night}夜 - 行动详情]")
+            if action.get("guard"):
+                lines.append(f"  {action['guard']}")
+            else:
+                lines.append("  守卫：未守护 / 本局无守卫")
+            if action.get("seer"):
+                lines.append(f"  {action['seer']}")
+            else:
+                lines.append("  预言家：未查验 / 本局无预言家")
+            if action.get("wolf"):
+                lines.append(f"  {action['wolf']}")
+            if action.get("witch_heal"):
+                lines.append(f"  {action['witch_heal']}")
+            if action.get("witch_poison"):
+                lines.append(f"  {action['witch_poison']}")
+            if action.get("result"):
+                lines.append(f"  => {action['result']}")
+            lines.append("")
+
+            # 对应白天
+            day_num = night
+            day_entries = day_groups.get(day_num, [])
+            if day_entries:
+                lines.append(f"[第{day_num}天 - 白天记录]")
+                for entry in day_entries:
+                    lines.append(f"  {entry}")
+                lines.append("")
+
+        # 没有被分组的条目（可能是第0天或边界情况）
+        for d in sorted(day_groups.keys()):
+            if d == 0 or d not in [a.get("night") for a in self.night_actions]:
+                entries = day_groups[d]
+                if entries:
+                    header = f"[第{d}天 - 白天记录]" if d > 0 else "[其他记录]"
+                    lines.append(header)
+                    for entry in entries:
+                        lines.append(f"  {entry}")
+                    lines.append("")
+
+        # 胜负
+        if self.winner:
+            winner_text = "狼人阵营获胜" if self.winner is Team.WOLF else "好人阵营获胜"
+            lines.append(f"[结局] {winner_text}")
+
+        return "\n".join(lines)
 
     def public_roles_reveal(self) -> str:
         """游戏结束时公开所有人的身份，并揭晓每个座位号背后的真实玩家。"""
