@@ -1582,7 +1582,8 @@ async def phase_reveal(state: GameState, panel: Panel) -> None:
     view.stop()
 
 
-async def phase_guard(bot, state: GameState, panel: Panel) -> int | None:
+async def phase_guard(bot, state: GameState, panel: Panel,
+                      day_log: list[str] | None = None) -> int | None:
     """守卫夜晚，返回今晚守护目标 uid（None = 没守 / 本局没有守卫）。
 
     与预言家同款拟真：不论守卫是真人 / AI / 本局没有，对外都显示同一块带按钮的面板，
@@ -1602,18 +1603,19 @@ async def phase_guard(bot, state: GameState, panel: Panel) -> int | None:
         guard_uid = result["uid"]
     else:
         await asyncio.sleep(_npc_night_delay())
-        if guard is not None:  # NPC 守卫：随机延迟后按规则选守护目标
-            guard_uid = await npc.guard_target(guard, state)
+        if guard is not None:  # NPC 守卫：按策略选守护目标
+            guard_uid = await npc.guard_target(guard, state, day_log)
     view.stop()
     if guard is not None:
         guard.last_guard_uid = guard_uid
     return guard_uid
 
 
-async def phase_seer(bot, state: GameState, panel: Panel) -> None:
+async def phase_seer(bot, state: GameState, panel: Panel,
+                     day_log: list[str] | None = None) -> None:
     # NPC 预言家先行动（AI 选最有价值的目标查验）
     for seer in [p for p in state.alive_players if p.role is Role.SEER and p.is_npc]:
-        t = await npc.seer_check_target(seer, state)
+        t = await npc.seer_check_target(seer, state, day_log)
         if t is not None:
             seer.seer_results[t] = bool(state.get(t).role.is_wolf)
 
@@ -1634,12 +1636,13 @@ async def phase_seer(bot, state: GameState, panel: Panel) -> None:
     view.stop()
 
 
-async def phase_wolves(bot, state: GameState, panel: Panel, channel) -> int | None:
+async def phase_wolves(bot, state: GameState, panel: Panel, channel,
+                       day_log: list[str] | None = None) -> int | None:
     """狼人夜晚，返回最终击杀目标 uid（None / 0 = 空刀）。"""
     votes: dict[int, int] = {}
     # NPC 狼先投（AI 选战略目标；全队当晚共用一个刀法）
     for wolf in [w for w in state.alive_wolves() if w.is_npc]:
-        t = await npc.wolf_kill_target(state)
+        t = await npc.wolf_kill_target(state, day_log)
         if t is not None:
             votes[wolf.uid] = t
 
@@ -1676,7 +1679,7 @@ async def phase_wolves(bot, state: GameState, panel: Panel, channel) -> int | No
     # 没投的真人狼兜底
     for w in state.alive_wolves():
         if w.uid not in votes:
-            t = await npc.wolf_kill_target(state)
+            t = await npc.wolf_kill_target(state, day_log)
             if t is not None:
                 votes[w.uid] = t
 
@@ -2320,8 +2323,8 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
             seer = state.alive_seer()
             seer_results_before = dict(seer.seer_results) if seer else {}
 
-            guard_uid = await phase_guard(bot, state, panel)
-            await phase_seer(bot, state, panel)
+            guard_uid = await phase_guard(bot, state, panel, day_log)
+            await phase_seer(bot, state, panel, day_log)
 
             # 检测预言家本轮新增的查验结果
             seer_target_uid, seer_result = None, None
@@ -2332,7 +2335,7 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
                         seer_result = is_wolf
                         break
 
-            kill_uid = await phase_wolves(bot, state, panel, channel)
+            kill_uid = await phase_wolves(bot, state, panel, channel, day_log)
             witch_res = await phase_witch(bot, state, panel, kill_uid, day_log)
             deaths = state.resolve_night(
                 kill_uid, witch_res["heal"], witch_res["poison"], guard_uid)
