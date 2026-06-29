@@ -2219,7 +2219,8 @@ async def _save_game_record(state: GameState, day_log: list[str]) -> None:
         "table_size": state.table_size,
         "winner": state.winner.value,
         "day_count": state.day_count,
-        "record": {"players": players, "log": day_log},
+        "record": {"players": players, "log": day_log,
+                    "night_actions": state.night_actions},
     }
     await database.insert_game(record)
 
@@ -2262,6 +2263,25 @@ async def _cleanup_after_game(bot: discord.Client, wolf_thread_id: int | None, o
             await _purge_bot_messages(bot, origin)
 
 
+async def _send_review(channel, review_text: str) -> None:
+    """把赛后复盘报告拆成多段发送（Discord 单条消息限 2000 字符）。"""
+    chunks: list[str] = []
+    current = ""
+    for line in review_text.split("\n"):
+        if len(current) + len(line) + 1 > 1900:
+            chunks.append(current)
+            current = line
+        else:
+            current = current + "\n" + line if current else line
+    if current:
+        chunks.append(current)
+    for i, chunk in enumerate(chunks):
+        try:
+            await channel.send(f"```\n{chunk}\n```")
+        except Exception:
+            pass
+
+
 async def run_game(bot: discord.Client, state: GameState, channel) -> None:
     state.play_channel_id = channel.id
     panel = Panel(channel)
@@ -2284,8 +2304,8 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
             await channel.send("⚠️ 人数不足（至少 3 人），游戏取消。")
             return
 
-        # 2) 分配角色（按配置的板子预设）
-        state.assign_roles(state.board)
+        # 2) 分配角色（按配置的板子预设；测试模式可指定部分座位角色）
+        state.assign_roles(state.board, fixed_roles=state.fixed_roles)
         await phase_reveal(state, panel)
 
         # 3) 昼夜循环（守卫 → 预言家 → 狼人 → 女巫）
@@ -2294,12 +2314,41 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
             # 每个昼夜周期都新开一块面板：上一天的面板（连同当天所有发言/票型）就留在
             # 频道里不动，方便大家往上翻、复盘前一天的发言和投票动机。
             panel = Panel(channel)
+            night_num = state.day_count + 1
+
+            # 记住预言家本轮查验前的结果集（用于检测新增查验）
+            seer = state.alive_seer()
+            seer_results_before = dict(seer.seer_results) if seer else {}
+
             guard_uid = await phase_guard(bot, state, panel)
             await phase_seer(bot, state, panel)
+
+            # 检测预言家本轮新增的查验结果
+            seer_target_uid, seer_result = None, None
+            if seer:
+                for uid, is_wolf in seer.seer_results.items():
+                    if uid not in seer_results_before:
+                        seer_target_uid = uid
+                        seer_result = is_wolf
+                        break
+
             kill_uid = await phase_wolves(bot, state, panel, channel)
             witch_res = await phase_witch(bot, state, panel, kill_uid, day_log)
             deaths = state.resolve_night(
                 kill_uid, witch_res["heal"], witch_res["poison"], guard_uid)
+
+            # 记录夜晚行动（复盘用）
+            state.record_night_action(
+                night_num,
+                guard_uid=guard_uid,
+                seer_uid=seer.uid if seer else None,
+                seer_target=seer_target_uid,
+                seer_result=seer_result,
+                wolf_kill=kill_uid,
+                witch_heal=witch_res["heal"],
+                witch_poison=witch_res["poison"],
+                deaths=deaths,
+            )
 
             await announce_deaths(bot, state, panel, channel, deaths, day_log)
             if state.check_winner():
@@ -2315,6 +2364,9 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
                 break
 
         await announce_end(channel, panel, state)
+        # 赛后复盘：在频道里发送详细行动记录
+        review_text = state.format_review(day_log)
+        await _send_review(channel, review_text)
         await _save_game_record(state, day_log)
     except Exception:
         log.exception("游戏运行出错")
@@ -2484,6 +2536,94 @@ async def api_cmd(interaction: discord.Interaction, station: str | None = None):
               if ok else f"🔴 切过去了，但自检失败：{why}（可再切回别的站）")
     await interaction.followup.send(
         f"🔌 已切换到 **{llm.active_name()}**\n{status}", ephemeral=True)
+
+
+# ============================================================
+# 角色名中英对照（用于 /werewolf test 解析）
+# ============================================================
+_ROLE_ALIAS: dict[str, Role] = {
+    "狼人": Role.WEREWOLF, "狼": Role.WEREWOLF, "werewolf": Role.WEREWOLF,
+    "白狼王": Role.WOLF_KING, "wolf_king": Role.WOLF_KING, "wolfking": Role.WOLF_KING,
+    "预言家": Role.SEER, "预言": Role.SEER, "seer": Role.SEER,
+    "女巫": Role.WITCH, "witch": Role.WITCH,
+    "猎人": Role.HUNTER, "hunter": Role.HUNTER,
+    "守卫": Role.GUARD, "guard": Role.GUARD,
+    "白痴": Role.IDIOT, "idiot": Role.IDIOT,
+    "骑士": Role.KNIGHT, "knight": Role.KNIGHT,
+    "平民": Role.VILLAGER, "民": Role.VILLAGER, "villager": Role.VILLAGER,
+}
+
+
+def _parse_role_spec(spec: str) -> dict[int, Role]:
+    """解析角色指定字符串，如 '1:狼人,2:预言家,3:女巫'。返回 {座位号: Role}。"""
+    result: dict[int, Role] = {}
+    import re as _re
+    for tok in spec.replace("，", ",").replace("：", ":").replace("＝", "=").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        m = _re.match(r"(\d+)\s*[:=号]\s*(.+)", tok)
+        if not m:
+            continue
+        seat = int(m.group(1))
+        role_name = m.group(2).strip().lower()
+        role = _ROLE_ALIAS.get(role_name)
+        if role is not None and seat > 0:
+            result[seat] = role
+    return result
+
+
+@werewolf.command(name="test", description="测试模式：指定座位角色开局（调试 AI 行为用）")
+@app_commands.describe(
+    roles="指定角色，如 1:狼人,2:预言家,3:女巫,4:守卫（未指定的座位随机分配）",
+)
+async def test_game(interaction: discord.Interaction, roles: str):
+    cid = interaction.channel_id
+    if cid in games:
+        await interaction.response.send_message(
+            "本频道已有一局进行中。用 `/werewolf cancel` 可取消。", ephemeral=True)
+        return
+    fixed = _parse_role_spec(roles)
+    if not fixed:
+        await interaction.response.send_message(
+            "❌ 解析失败。格式示例：`1:狼人,2:预言家,3:女巫`\n"
+            "可用角色：狼人/白狼王/预言家/女巫/猎人/守卫/白痴/骑士/平民",
+            ephemeral=True)
+        return
+
+    state = GameState(channel_id=cid, host_id=interaction.user.id)
+    state.board = config.BOARD
+    state.fixed_roles = fixed
+    state.add_human(interaction.user.id, interaction.user.display_name)
+    games[cid] = state
+
+    role_desc = "、".join(f"{s}号={r.cn}" for s, r in sorted(fixed.items()))
+    thread: discord.Thread | None = None
+    channel = interaction.channel
+    if isinstance(channel, discord.TextChannel):
+        try:
+            thread = await channel.create_thread(
+                name=f"🧪 测试局 · {interaction.user.display_name}",
+                type=discord.ChannelType.private_thread,
+                invitable=False, auto_archive_duration=1440,
+                slowmode_delay=THREAD_SLOWMODE_SECONDS,
+            )
+            await thread.add_user(interaction.user)
+            await thread.send(
+                f"🧪 这是**测试模式**，已指定角色：{role_desc}\n"
+                "未指定的座位将随机分配。游戏结束后会发送详细复盘。")
+            state.thread_id = thread.id
+        except discord.HTTPException:
+            thread = None
+
+    view = LobbyView(client, state, thread)
+    embed = view.embed()
+    embed.title = "🧪 狼人杀测试局"
+    embed.description = (
+        f"**测试模式** — 已指定角色：{role_desc}\n"
+        f"未指定的座位随机分配。\n\n" + (embed.description or ""))
+    await interaction.response.send_message(embed=embed, view=view)
+    view.message = await interaction.original_response()
 
 
 client.tree.add_command(werewolf)
