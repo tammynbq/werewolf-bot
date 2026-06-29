@@ -272,8 +272,7 @@ def _parse_seat(raw: str, valid_seats: dict[int, int]) -> int | None:
 # ============================================================
 # 规则兜底（LLM 不可用时用，保证流程推进）
 # ============================================================
-def _rule_wolf_kill(state: GameState) -> int | None:
-    # 若某只狼绑定了恋人且恋人在场，硬保护：刀法绕开她。
+def _rule_wolf_kill(state: GameState, day_log: list[str] | None = None) -> int | None:
     protect = set()
     for w in state.alive_wolves():
         lv = config.LOVER_BINDINGS.get(w.name)
@@ -281,9 +280,21 @@ def _rule_wolf_kill(state: GameState) -> int | None:
             protect.add(lv)
     candidates = [p for p in state.alive_villagers() if p.uid not in protect]
     if not candidates:
-        candidates = state.alive_villagers()  # 万一只剩恋人可刀，才不护（基本不会）
+        candidates = state.alive_villagers()
     if not candidates:
         return None
+
+    if day_log and state.day_count > 0:
+        claimed = _scan_claimed_seer_seats(day_log)
+        for seat in claimed:
+            t = next((p for p in candidates if p.seat == seat), None)
+            if t is not None:
+                return t.uid
+        gods = [p for p in candidates if p.role and p.role not in (Role.VILLAGER,)
+                and not p.role.is_wolf]
+        if gods:
+            return random.choice(gods).uid
+
     return random.choice(candidates).uid
 
 
@@ -438,6 +449,22 @@ def _scan_seer_report(state: GameState, recent_log: list[str]) -> int | None:
     return None
 
 
+def _scan_claimed_seer_seats(recent_log: list[str]) -> list[int]:
+    """从发言记录中找出声称自己是预言家的座位号（纯文本启发式，免费）。"""
+    claimers: set[int] = set()
+    seer_kw = ("我是预言家", "跳预言家", "我验了", "我查了", "我的查验",
+               "报验", "我昨晚验", "我验出", "我查出", "我是真预言家",
+               "预言家是我")
+    for line in recent_log:
+        m = re.match(r"\s*(\d+)\s*号\s*[(:：]", line)
+        if not m:
+            continue
+        body = line[m.end():]
+        if any(k in body for k in seer_kw):
+            claimers.add(int(m.group(1)))
+    return sorted(claimers)
+
+
 def _suspect_from_notes(voter: Player, state: GameState, exclude: set[int] = frozenset()) -> int | None:
     """从该 NPC 自己的私人笔记里抠出它怀疑的座位号（存活、非自己、非排除），
     让它的投票和白天发言/盘算保持一致——免费且言行一致。"""
@@ -535,32 +562,59 @@ async def _seer_lover_wolf_vote(seer: Player, state: GameState,
 # ============================================================
 # 夜晚 · 预言家查验（轻量规则，不花 API：随机查一个没查过的人）
 # ============================================================
-async def seer_check_target(seer: Player, state: GameState) -> int | None:
-    # 决策走规则省调用；预言家「会不会报验带队」由白天的 LLM 发言体现。
-    return _rule_seer_check(seer, state)
+async def seer_check_target(seer: Player, state: GameState,
+                            day_log: list[str] | None = None) -> int | None:
+    """预言家查验：优先查声称是预言家的人（可能是悍跳狼），然后查笔记里怀疑的人，最后随机。"""
+    unchecked = [
+        p for p in state.alive_players
+        if p.uid != seer.uid and p.uid not in seer.seer_results
+    ]
+    if not unchecked:
+        return _rule_seer_check(seer, state)
+
+    if day_log and state.day_count > 0:
+        claimed = _scan_claimed_seer_seats(day_log)
+        for seat in claimed:
+            t = next((p for p in unchecked if p.seat == seat), None)
+            if t is not None:
+                return t.uid
+
+    suspect = _suspect_from_notes(seer, state)
+    if suspect is not None and suspect not in seer.seer_results:
+        return suspect
+
+    return random.choice(unchecked).uid
 
 
 # ============================================================
 # 夜晚 · 守卫守护（轻量规则，不花 API）
 # ============================================================
-async def guard_target(guard: Player, state: GameState) -> int | None:
-    """守卫选今晚守护谁：不能连守同一人，随机守一名存活玩家（含自己）。
+async def guard_target(guard: Player, state: GameState,
+                       day_log: list[str] | None = None) -> int | None:
+    """守卫选今晚守护谁（不能连守同一人）。
 
-    守卫没有验人信息，规则上随机守护即可（守自己也是常见保命选择）；
-    省 token 又稳健，真正的「守谁」博弈交给真人守卫去玩。
-    但若守卫心里有认定的人(恋人)且她在场，则优先守她——守护就是守卫表达「保她」的方式。
+    优先级：恋人 → 已跳预言家（最容易被狼针对） → 随机。
+    首夜如果没有信息，可以盲空（守自己或随机），把救人权交给女巫避免同守同救。
     """
-    # 守卫·恋人：在场就优先守她（规则不允许连守同一人时，退而守别人/自己）
     lover = _lover_uid(guard, state)
     if lover is not None:
         lp = state.get(lover)
         if lp is not None and lp.alive and lp.uid != guard.last_guard_uid:
             return lover
+
     candidates = [p for p in state.alive_players if p.uid != guard.last_guard_uid]
     if not candidates:
         candidates = list(state.alive_players)
     if not candidates:
         return None
+
+    if day_log and state.day_count > 0:
+        claimed = _scan_claimed_seer_seats(day_log)
+        for seat in claimed:
+            t = next((p for p in candidates if p.seat == seat and p.alive), None)
+            if t is not None and t.uid != guard.uid:
+                return t.uid
+
     return random.choice(candidates).uid
 
 
@@ -614,16 +668,51 @@ async def wolf_king_shoot_target(wolf_king: Player, state: GameState) -> int | N
 # ============================================================
 # 夜晚 · 狼刀（轻量规则，不花 API；全队当晚共用一个刀法）
 # ============================================================
-async def wolf_kill_target(state: GameState) -> int | None:
-    # 决策走规则省调用；狼队「怎么配合、刀谁」由狼人频道的 LLM 私聊体现，
-    # 且有真人狼时最终刀谁听真人队长的（在 bot.py 结算）。当晚缓存，全队一致。
+async def wolf_kill_target(state: GameState,
+                           day_log: list[str] | None = None) -> int | None:
     key = (id(state), state.day_count)
     if key not in _WOLF_PLAN:
-        _WOLF_PLAN[key] = _rule_wolf_kill(state)
+        _WOLF_PLAN[key] = _rule_wolf_kill(state, day_log)
     return _WOLF_PLAN[key]
 
 
 # ============================================================
+async def _witch_general_poison(witch: Player, state: GameState,
+                                recent_log: list[str]) -> int | None:
+    """女巫根据场上信息（预言家报验、日间讨论等）决定要不要毒人。
+    没有可靠信息时倾向不毒（凭空毒人很可能毒到好人）。"""
+    alive = [p for p in state.alive_players if p.uid != witch.uid]
+    if not alive:
+        return None
+    valid_seats = {p.seat: p.uid for p in alive}
+    seat_list = "、".join(f"{p.seat}号" for p in alive)
+    log_text = "\n".join(recent_log[-20:]) or "（暂无）"
+    notes = _notes(witch.uid) or "（暂无）"
+    system = (
+        f"你正在玩中文《狼人杀》，你是女巫(好人阵营)，手里还有毒药（一瓶，只能用一次）。"
+        f"你是【{witch.seat}号】。{_persona_clause(witch)}"
+        f"你的私人笔记：{notes}。"
+        "根据白天的发言和讨论，判断有没有你比较确定是狼人的目标可以毒掉。"
+        "注意：毒药非常珍贵，毒错好人会严重坑好人阵营。"
+        "只有在有比较可靠的信息（比如预言家公开验出狼、或者多条线索指向同一人）时才考虑动手。"
+        "如果没把握，宁可不毒——不毒永远不算错，毒错很致命。"
+        f"{_COT_INSTRUCTION}"
+        '只输出 JSON：{"poison": <true 或 false>, "target": <座位号数字或 0>, "reason":"<10字内>"}。'
+    )
+    user = (
+        f"存活玩家：{seat_list}\n"
+        f"白天发言摘要：\n{log_text}\n"
+        f"你要用毒药吗？如果要，毒谁？只输出 JSON："
+    )
+    data = await _ask_json(system, user, max_tokens=160, temperature=0.6,
+                           profile=_profile_for(witch))
+    if data and data.get("poison") in (True, "true", "True", 1, "1"):
+        seat = _coerce_seat(data.get("target"), valid_seats)
+        if seat is not None:
+            return valid_seats[seat]
+    return None
+
+
 # 夜晚 · 女巫用药（LLM 决定救/毒，前期倾向救人、没把握不毒）
 # ============================================================
 async def witch_night_action(
@@ -632,13 +721,14 @@ async def witch_night_action(
 ) -> tuple[bool, int | None]:
     """返回 (是否用解药救, 毒药目标 uid 或 None)。
 
-    稳健好人女巫的基础规则：
-    - 解药：第一晚有人被刀、且被刀的不是自己 → 救（前期人命金贵，经典打法救首刀）。
-    - 毒药：没有可靠信息一律不毒（凭空毒人很可能毒到好人）。
+    解药规则：
+    - 第一晚有人被刀、且被刀的不是自己 → 救（经典打法救首刀）。
+    - 恋人被刀 → 不惜代价救她（任何一晚都救）。
 
-    恋人（需求1，按性格行动）：
-    - 解药：被刀的就是恋人 → 不惜代价救她（任何一晚都救，不止首刀）。
-    - 毒药：恋人白天被人带头推票时，按女巫的人设性格决定要不要毒掉那个攻击者。
+    毒药规则（同一晚不既救又毒）：
+    - 恋人白天被推票时，按性格决定要不要毒掉攻击者。
+    - 非恋人场景 / 恋人报复未触发时，根据场上信息（预言家报验、讨论共识等）
+      由 LLM 决定是否毒人（第二晚起，需有可靠信息才会动手）。
     """
     if not (witch.has_heal or witch.has_poison):
         return False, None
@@ -659,6 +749,10 @@ async def witch_night_action(
             attacker = _lover_attacker_seat(state, lover, recent_log)
             if attacker is not None and attacker != witch.seat:
                 poison = await _witch_avenge_lover(witch, state, lp, attacker, recent_log)
+
+    if poison is None and witch.has_poison and not heal and state.day_count > 0 and recent_log:
+        poison = await _witch_general_poison(witch, state, recent_log)
+
     return heal, poison
 
 
@@ -774,37 +868,115 @@ def _leaks_identity(text: str) -> bool:
 # ============================================================
 # 白天 · 发言（决策式发言：先盘算再开口，并更新私人笔记）
 # ============================================================
-def _speak_strategy(player: Player) -> str:
-    if player.role is Role.WEREWOLF:
-        return ("你要伪装成好人：适度怀疑别人、保护狼队友、必要时悍跳或带歪节奏，但别太刻意露馅。")
+def _speak_strategy(player: Player, state: GameState, recent_log: list[str]) -> str:
+    """角色专属的发言战术指引，根据当前局势动态调整。"""
+    day = state.day_count
+    claimed = _scan_claimed_seer_seats(recent_log)
+    my_seat = player.seat
+
+    # ── 狼人 / 白狼王 ──
+    if player.role is Role.WEREWOLF or player.role is Role.WOLF_KING:
+        extra = "（你是白狼王，被票出时可以带走一人——这是底牌，别提前暴露。）" if player.role is Role.WOLF_KING else ""
+        if day <= 1 and not claimed:
+            return (f"{extra}你是狼人阵营，需要伪装。第一天还没人跳预言家，你的战术选项：\n"
+                    "• 悍跳预言家：编造查验结果（给队友发假金水 / 查杀一个好人），抢占信任位搅浑水；\n"
+                    "• 低调打民牌：做有逻辑的普通发言，先观望再找机会配合队友；\n"
+                    "• 倒钩预备：先表现得像靠谱好人，建立信任，后面关键时刻再出卖信息搅局。\n"
+                    "狼队最多一人悍跳，按你的性格（冲动→悍跳，沉稳→倒钩/低调）选一种，发言要自然。")
+        if day <= 1 and claimed:
+            if my_seat in claimed:
+                return (f"{extra}你已经悍跳预言家了，继续维护假身份。"
+                        "编造合理的查验结果，质疑对跳者的逻辑漏洞，"
+                        "争取让好人相信你才是真预言家。语气坚定、别怂。")
+            return (f"{extra}已经有人跳预言家了。你的战术选项：\n"
+                    "• 对跳预言家：也声称自己是预言家，编造矛盾的查验，让好人无法判断真假；\n"
+                    "• 冲锋站边：如果狼队友悍跳了，帮他打掩护、质疑真预言家的逻辑；\n"
+                    "• 倒钩：表面站真预言家争取信任，关键时刻再反水投真预言家或搅混水；\n"
+                    "• 低调观望：做有逻辑的中立发言，不急着站队。\n"
+                    "按你的性格选一种。冲锋狼别和悍跳狼票型完全重叠，会暴露团队。")
+        return (f"{extra}你是狼人，继续伪装。延续之前的立场——"
+                "悍跳了就维护谎言、编新查验；倒钩就找机会反水；低调就继续输出逻辑。"
+                "注意票型别和狼队友重叠太明显，那是最大的破绽。")
+
+    # ── 预言家 ──
     if player.role is Role.SEER:
-        return ("你是预言家：如果查到狼或局势需要，可以跳出来报验带队(说清验了谁、是好是狼)；"
-                "也可以视情况先隐藏。要让好人跟上你的信息。")
+        has_kills = any(v is True for v in player.seer_results.values())
+        seer_report = ""
+        if player.seer_results:
+            parts = []
+            for uid, is_wolf in player.seer_results.items():
+                t = state.get(uid)
+                if t:
+                    parts.append(f"{t.seat}号{'查杀' if is_wolf else '金水'}")
+            seer_report = "你的真实查验结果：" + "、".join(parts) + "。"
+        report_rule = ("\n【报验纪律】只能基于真实查验发言——查杀=验过且为狼的座位，"
+                       "金水=验过且为好人的座位，没验过的别乱报。"
+                       "vote 必须和嘴上的立场一致——说投谁就投谁。")
+        if day <= 1:
+            if has_kills:
+                return (f"你是预言家。{seer_report}"
+                        "你有查杀，强烈建议跳预言家报查杀带队——信息越早公开，好人越容易跟票。"
+                        "如果有人悍跳抢你的位置，你必须对跳揭穿、报出真实查验。"
+                        "也可以按性格选暗中引导投票（风险大，但可以保命不被狼针对）。"
+                        f"{report_rule}")
+            return (f"你是预言家。{seer_report}"
+                    "目前只有金水没有查杀。你可以：\n"
+                    "• 跳出来报金水，帮好人确认安全位（但暴露后被狼针对）；\n"
+                    "• 先不跳，观望：看谁跳、谁像狼，等有查杀再一并报（更安全但延迟信息）；\n"
+                    "• 如果有人悍跳了假预言家，考虑对跳揭穿。\n"
+                    f"按你的性格和局势判断。{report_rule}")
+        return (f"你是预言家。{seer_report}"
+                "根据局势分享查验带队。还没跳过就考虑现在跳——好人需要铁信息。"
+                f"已经跳了就报最新查验、分析票型、带队投狼。{report_rule}")
+
+    # ── 女巫 ──
     if player.role is Role.WITCH:
-        return ("你是女巫：低调找狼，别轻易暴露身份(暴露会被狼针对)，但可以引导投票。"
-                "若有可信的预言家报验了狼，就声援他、号召大家投那个狼。")
+        if day <= 1 and len(claimed) <= 1:
+            return ("你是女巫（好人阵营），低调找狼。你的战术选项：\n"
+                    "• 正常发言分析找狼，别暴露女巫身份（暴露会被狼连夜针对）；\n"
+                    "• 高阶挡刀：假跳预言家（编一个查验结果），吸引狼火力、"
+                    "让真预言家安全潜伏。风险是消耗好人信任位、且你可能被推出去。\n"
+                    "大多数情况低调更稳，但如果你性格冲动或局势需要可以挡刀。"
+                    "若有可信的预言家报验了狼，声援他、号召一起投。")
+        return ("你是女巫：低调找狼，别暴露身份。引导投票、声援可信的预言家。"
+                "若有人对跳预言家搅局，帮好人分析谁的逻辑更合理。")
+
+    # ── 守卫 ──
     if player.role is Role.GUARD:
-        return ("你是守卫：低调找狼、别轻易暴露身份(暴露会被狼针对)，可以引导投票；"
-                "夜里守谁是你的秘密，发言时别直说自己守了谁。")
+        return ("你是守卫：低调找狼、别暴露身份（暴露会被狼针对，守卫的价值在于暗中保人）。"
+                "发言分析逻辑、引导投票。夜里守谁是你的秘密——绝不暗示守卫身份或守了谁。"
+                "声援可信的预言家，但别让人猜到你是守卫在保他。")
+
+    # ── 猎人 ──
     if player.role is Role.HUNTER:
-        return ("你是猎人：靠逻辑找狼，可适时亮身份用『我出局会开枪』威慑狼，也可以隐藏；"
+        return ("你是猎人：靠逻辑找狼。你的战术选项：\n"
+                "• 适时亮身份——用「我出局会开枪」威慑狼，让狼不敢推你；\n"
+                "• 隐藏身份当诱饵——故意发言露点破绽，让狼以为你是好推的平民，"
+                "推你出去时反手拍枪牌带走一只狼（钓鱼打法）。\n"
                 "有可信预言家报验狼时号召一起投。")
+
+    # ── 白痴 ──
     if player.role is Role.IDIOT:
         if player.idiot_revealed:
-            return ("你已翻牌白痴，不能投票了，但仍可发言帮好人分析；"
-                    "大胆说出你的判断，帮好人理清逻辑。")
-        return ("你是白痴：不怕被票（被票出自动翻牌免死），所以可以大胆发言、甚至故意引票试探；"
-                "但别暴露身份，让狼以为票你能赚。")
+            return ("你已翻牌白痴，不能投票了，但仍可发言帮好人分析——"
+                    "大胆说出判断，帮好人理清逻辑。你是铁好人，说话有公信力。")
+        return ("你是白痴：不怕被票（被票出自动翻牌免死），大胆发言试探、甚至故意拉仇恨引票。"
+                "别暴露白痴身份，让狼以为你好推——推了你等于浪费一天。")
+
+    # ── 骑士 ──
     if player.role is Role.KNIGHT:
         if player.has_dueled:
             return "你是骑士但决斗已用完，靠逻辑找狼、投票抓狼。"
-        return ("你是骑士：有一次翻牌决斗机会（对方是狼则狼死，不是狼你死），"
-                "看准了再用；没把握就先靠逻辑找狼。")
-    if player.role is Role.WOLF_KING:
-        return ("你是白狼王：伪装成好人，适度怀疑别人、保护狼队友；"
-                "被票出时你能带走一人，这是你的底牌。")
-    return ("你是平民：靠逻辑找狼，多分析别人的发言和票型，推动好人抓狼。"
-            "若有人跳预言家报验了某人是狼且没人对跳，就明确表态跟他、号召一起投那个狼。")
+        return ("你是骑士：有一次翻牌决斗机会（对方是狼→狼死，不是狼→你死）。"
+                "看准了再用——最好等预言家报验或票型暴露后，决斗一个高概率是狼的人。"
+                "没把握就先靠逻辑找狼、积累信息。")
+
+    # ── 平民 ──
+    return ("你是平民（好人阵营）：靠逻辑和票型找狼。你的打法：\n"
+            "• 分析发言：谁的视角像上帝视角（不经意保护身份不明的好人）→嫌疑大；\n"
+            "• 看票型：发言和投票不一致的人嫌疑极大；多人同时冲票同一人可能是狼绑票；\n"
+            "• 高阶平民不怕死，怕死得没有价值——敢输出强硬逻辑拉仇恨，被狼刀等于替神挡刀。\n"
+            "有人跳预言家报验了狼且没人对跳，明确站边他、号召投那个狼。")
 
 
 def _lover_uid(player: Player, state: GameState,
@@ -824,20 +996,10 @@ async def speak(player: Player, state: GameState, recent_log: list[str]) -> str:
     # 多带几轮日志，方便 NPC 顺前一天的发言/票型逻辑（不止看当天）
     log_text = "\n".join(recent_log[-24:]) if recent_log else "（第一天，暂无信息）"
 
-    # 预言家报验纪律（需求2）：只能基于真实查验报验，且 vote 必须与口头查杀一致。
-    seer_clause = ""
-    if player.role is Role.SEER:
-        seer_clause = (
-            "\n【预言家·报验纪律】你只能基于真实查验结果发言：查杀=你验过且为狼的座位，"
-            "金水=你验过且为好人的座位，没验过的座位别乱报。"
-            "若你有查杀狼：按性格选『直接跳预言家报查杀带队』或『先压一手暗中带票』，"
-            "但你的 vote 必须就是那只查杀的狼——绝不能嘴上喊查杀某号、手上却投别人(言行必须一致)。"
-            "若你只有金水没有查杀：按性格选『直接报金水带队』或『暗中保金水、把票引向可疑的人』。")
-
     system = (
         "你是一名正在玩中文桌游《狼人杀》的真人玩家，绝对不是 AI，也绝不承认自己是 AI 或跳出游戏。"
         f"你是【{player.seat}号】。{_persona_clause(player)} 你的发言要带出这个人设的语气和风格。"
-        f"{_speak_strategy(player)}{seer_clause}\n"
+        f"{_speak_strategy(player, state, recent_log)}\n"
         f"{_NO_OMNISCIENCE}\n"
         f"{knowledge.playbook_for((p.role for p in state.players if p.role), has_sheriff=state.has_sheriff)}\n"
         "要求：\n"
