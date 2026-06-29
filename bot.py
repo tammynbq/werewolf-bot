@@ -2247,20 +2247,20 @@ async def _purge_bot_messages(bot: discord.Client, channel, limit: int = 200) ->
 
 
 async def _cleanup_after_game(bot: discord.Client, wolf_thread_id: int | None, origin_channel_id: int | None) -> None:
-    """游戏结束 CLEANUP_DELAY_SECONDS 秒后：删除本局狼人专属子区，并清理频道里
-    残留的狼人杀消息（如已经过期的大厅面板）。"""
+    """游戏结束 CLEANUP_DELAY_SECONDS 秒后：删除本局狼人专属子区。"""
     await asyncio.sleep(config.CLEANUP_DELAY_SECONDS)
     if wolf_thread_id:
         wt = bot.get_channel(wolf_thread_id)
+        if not isinstance(wt, discord.Thread):
+            try:
+                wt = await bot.fetch_channel(wolf_thread_id)
+            except discord.HTTPException:
+                wt = None
         if isinstance(wt, discord.Thread):
             try:
                 await wt.delete()
             except discord.HTTPException:
                 pass
-    if origin_channel_id:
-        origin = bot.get_channel(origin_channel_id)
-        if origin is not None:
-            await _purge_bot_messages(bot, origin)
 
 
 async def _send_review(channel, review_text: str) -> None:
@@ -2379,8 +2379,7 @@ async def run_game(bot: discord.Client, state: GameState, channel) -> None:
                 await channel.edit(archived=True)
             except discord.HTTPException:
                 pass
-        # 狼人子区留够时间让狼队复盘，CLEANUP_DELAY_SECONDS 秒后自动删除；
-        # 同时清理频道里残留的狼人杀消息（如已经过期的大厅面板）。
+        # 狼人子区留够时间让狼队复盘，CLEANUP_DELAY_SECONDS 秒后自动删除。
         asyncio.create_task(
             _cleanup_after_game(bot, state.wolf_thread_id, state.channel_id))
 

@@ -624,6 +624,42 @@ async def wolf_kill_target(state: GameState) -> int | None:
 
 
 # ============================================================
+async def _witch_general_poison(witch: Player, state: GameState,
+                                recent_log: list[str]) -> int | None:
+    """女巫根据场上信息（预言家报验、日间讨论等）决定要不要毒人。
+    没有可靠信息时倾向不毒（凭空毒人很可能毒到好人）。"""
+    alive = [p for p in state.alive_players if p.uid != witch.uid]
+    if not alive:
+        return None
+    valid_seats = {p.seat: p.uid for p in alive}
+    seat_list = "、".join(f"{p.seat}号" for p in alive)
+    log_text = "\n".join(recent_log[-20:]) or "（暂无）"
+    notes = _notes(witch.uid) or "（暂无）"
+    system = (
+        f"你正在玩中文《狼人杀》，你是女巫(好人阵营)，手里还有毒药（一瓶，只能用一次）。"
+        f"你是【{witch.seat}号】。{_persona_clause(witch)}"
+        f"你的私人笔记：{notes}。"
+        "根据白天的发言和讨论，判断有没有你比较确定是狼人的目标可以毒掉。"
+        "注意：毒药非常珍贵，毒错好人会严重坑好人阵营。"
+        "只有在有比较可靠的信息（比如预言家公开验出狼、或者多条线索指向同一人）时才考虑动手。"
+        "如果没把握，宁可不毒——不毒永远不算错，毒错很致命。"
+        f"{_COT_INSTRUCTION}"
+        '只输出 JSON：{"poison": <true 或 false>, "target": <座位号数字或 0>, "reason":"<10字内>"}。'
+    )
+    user = (
+        f"存活玩家：{seat_list}\n"
+        f"白天发言摘要：\n{log_text}\n"
+        f"你要用毒药吗？如果要，毒谁？只输出 JSON："
+    )
+    data = await _ask_json(system, user, max_tokens=160, temperature=0.6,
+                           profile=_profile_for(witch))
+    if data and data.get("poison") in (True, "true", "True", 1, "1"):
+        seat = _coerce_seat(data.get("target"), valid_seats)
+        if seat is not None:
+            return valid_seats[seat]
+    return None
+
+
 # 夜晚 · 女巫用药（LLM 决定救/毒，前期倾向救人、没把握不毒）
 # ============================================================
 async def witch_night_action(
@@ -632,13 +668,14 @@ async def witch_night_action(
 ) -> tuple[bool, int | None]:
     """返回 (是否用解药救, 毒药目标 uid 或 None)。
 
-    稳健好人女巫的基础规则：
-    - 解药：第一晚有人被刀、且被刀的不是自己 → 救（前期人命金贵，经典打法救首刀）。
-    - 毒药：没有可靠信息一律不毒（凭空毒人很可能毒到好人）。
+    解药规则：
+    - 第一晚有人被刀、且被刀的不是自己 → 救（经典打法救首刀）。
+    - 恋人被刀 → 不惜代价救她（任何一晚都救）。
 
-    恋人（需求1，按性格行动）：
-    - 解药：被刀的就是恋人 → 不惜代价救她（任何一晚都救，不止首刀）。
-    - 毒药：恋人白天被人带头推票时，按女巫的人设性格决定要不要毒掉那个攻击者。
+    毒药规则（同一晚不既救又毒）：
+    - 恋人白天被推票时，按性格决定要不要毒掉攻击者。
+    - 非恋人场景 / 恋人报复未触发时，根据场上信息（预言家报验、讨论共识等）
+      由 LLM 决定是否毒人（第二晚起，需有可靠信息才会动手）。
     """
     if not (witch.has_heal or witch.has_poison):
         return False, None
@@ -659,6 +696,10 @@ async def witch_night_action(
             attacker = _lover_attacker_seat(state, lover, recent_log)
             if attacker is not None and attacker != witch.seat:
                 poison = await _witch_avenge_lover(witch, state, lp, attacker, recent_log)
+
+    if poison is None and witch.has_poison and not heal and state.day_count > 0 and recent_log:
+        poison = await _witch_general_poison(witch, state, recent_log)
+
     return heal, poison
 
 
