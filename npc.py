@@ -622,11 +622,17 @@ async def guard_target(guard: Player, state: GameState,
 # 出局 · 猎人开枪（轻量规则，不花 API）
 # ============================================================
 async def hunter_shoot_target(hunter: Player, state: GameState) -> int | None:
-    """猎人出局开枪带走谁：优先打自己笔记里最怀疑的人，否则随机带走一名存活玩家。"""
-    suspect = _suspect_from_notes(hunter, state)
+    """猎人出局开枪带走谁：优先打自己笔记里最怀疑的人，否则随机带走一名存活玩家。
+    绝不射杀恋人——笔记里提到恋人座位号是为了保护而非怀疑。"""
+    lover = _lover_uid(hunter, state)
+    exclude = {lover} if lover is not None else set()
+    suspect = _suspect_from_notes(hunter, state, exclude=exclude)
     if suspect is not None:
         return suspect
-    others = [p for p in state.alive_players if p.uid != hunter.uid]
+    others = [p for p in state.alive_players
+              if p.uid != hunter.uid and p.uid not in exclude]
+    if not others:
+        others = [p for p in state.alive_players if p.uid != hunter.uid]
     if not others:
         return None
     return random.choice(others).uid
