@@ -621,20 +621,48 @@ async def guard_target(guard: Player, state: GameState,
 # ============================================================
 # 出局 · 猎人开枪（轻量规则，不花 API）
 # ============================================================
-async def hunter_shoot_target(hunter: Player, state: GameState) -> int | None:
-    """猎人出局开枪带走谁：优先打自己笔记里最怀疑的人，否则随机带走一名存活玩家。
-    绝不射杀恋人——笔记里提到恋人座位号是为了保护而非怀疑。"""
+async def hunter_shoot_target(hunter: Player, state: GameState,
+                              day_log: list[str] | None = None) -> int | None:
+    """猎人出局开枪带走谁：用 LLM 综合全场发言决定，兜底用笔记/随机。
+    绝不射杀恋人。"""
     lover = _lover_uid(hunter, state)
     exclude = {lover} if lover is not None else set()
-    suspect = _suspect_from_notes(hunter, state, exclude=exclude)
-    if suspect is not None:
-        return suspect
     others = [p for p in state.alive_players
               if p.uid != hunter.uid and p.uid not in exclude]
     if not others:
         others = [p for p in state.alive_players if p.uid != hunter.uid]
     if not others:
         return None
+
+    valid_seats = {p.seat: p.uid for p in others}
+
+    # 用 LLM 综合全场发言来决定带走谁
+    if day_log:
+        log_text = "\n".join(day_log[-30:])
+        role_intro = (
+            "你是猎人（好人阵营），刚刚出局了，现在必须开枪带走一名玩家。"
+            "这是你对好人阵营最后的贡献——务必带走你最怀疑是狼人的那个人。"
+        )
+        task = (
+            f"根据以下全场发言记录，综合分析谁最可能是狼人，选一个带走。\n"
+            f"你的私人笔记：{_notes(hunter.uid) or '（暂无）'}\n"
+            f"全场发言：\n{log_text}"
+        )
+        target_uid = await _decide_target(
+            hunter, state, role_intro=role_intro, task=task,
+            valid_seats=valid_seats, temperature=0.5,
+        )
+        if target_uid is not None:
+            return target_uid
+
+    # LLM 失败时兜底：笔记 → 预言家报验 → 随机
+    if day_log:
+        report = _scan_seer_report(state, day_log)
+        if report is not None and report in {p.uid for p in others}:
+            return report
+    suspect = _suspect_from_notes(hunter, state, exclude=exclude)
+    if suspect is not None:
+        return suspect
     return random.choice(others).uid
 
 
@@ -783,8 +811,29 @@ async def vote_decision(voter: Player, state: GameState, recent_log: list[str]) 
         return None
 
     if voter.role is Role.WEREWOLF:
-        # 狼：别投队友（也别投恋人）。优先跟自己发言里的表态，再退而求其次。
+        # 狼：别投队友（也别投恋人）。用 LLM 综合全场发言选目标。
         mates = {p.uid for p in alive_others if p.role and p.role.is_wolf}
+        non_wolf_others = [p for p in alive_others if p.uid not in mates]
+        if non_wolf_others and recent_log:
+            valid_seats = {p.seat: p.uid for p in non_wolf_others}
+            log_text = "\n".join(recent_log[-30:])
+            role_intro = (
+                "你是狼人阵营，投票时要伪装成好人。"
+                "不能投狼队友，要投一个好人出局——最好投神职或对狼威胁最大的人。"
+            )
+            task = (
+                f"所有人已经发言完毕，现在投票。根据全场发言记录，"
+                f"选一个对狼阵营威胁最大、或者最容易被大家接受投出去的好人。\n"
+                f"你的私人笔记：{_notes(voter.uid) or '（暂无）'}\n"
+                f"全场发言：\n{log_text}"
+            )
+            llm_target = await _decide_target(
+                voter, state, role_intro=role_intro, task=task,
+                valid_seats=valid_seats, temperature=0.5,
+            )
+            if llm_target is not None:
+                return llm_target
+        # LLM 失败兜底
         intent = _vote_intent_uid(voter, state, exclude=mates | protect)
         if intent is not None:
             return intent
@@ -800,21 +849,36 @@ async def vote_decision(voter: Player, state: GameState, recent_log: list[str]) 
     if voter.role is Role.SEER:
         known = [p.uid for p in alive_others if voter.seer_results.get(p.uid) is True]
         if known:
-            # 优先投自己发言里点名的那只查杀狼，保证「嘴上查杀谁、手上就投谁」言行一致
             intent = _vote_intent_uid(voter, state, exclude=protect)
             if intent in known:
                 return intent
             return random.choice(known)
-    # 2) 有人跳预言家报验了某狼、且场面没对跳冲突 → 跟票。这是全场发言完才齐的最硬信息，
-    #    优先级高于自己早先发言时定的意向（这正是「全员发言后再决定」的核心）。
+    # 2) 有人跳预言家报验了某狼、且场面没对跳冲突 → 跟票。
     report = _scan_seer_report(state, recent_log)
     if report is not None and report != voter.uid and report not in protect:
         return report
-    # 3) 没有可信报验时，才投自己发言里明确表态要投的人——保持言行一致。
+    # 3) 用 LLM 综合全场发言重新判断投谁（核心修复：全局思考而非只看自己发言时的意向）。
+    if recent_log:
+        valid_seats = {p.seat: p.uid for p in alive_others}
+        if valid_seats:
+            log_text = "\n".join(recent_log[-30:])
+            role_intro = _role_brief(voter, state)
+            task = (
+                f"现在是投票环节，所有人已经发言完毕。根据全场发言记录，"
+                f"综合分析谁最可能是狼人、谁最应该被投出去。\n"
+                f"你的私人笔记：{_notes(voter.uid) or '（暂无）'}\n"
+                f"全场发言：\n{log_text}"
+            )
+            llm_target = await _decide_target(
+                voter, state, role_intro=role_intro, task=task,
+                valid_seats=valid_seats, temperature=0.5,
+            )
+            if llm_target is not None:
+                return llm_target
+    # 4) LLM 失败时兜底：发言意向 → 笔记 → 随机。
     intent = _vote_intent_uid(voter, state, exclude=protect)
     if intent is not None:
         return intent
-    # 4) 再不行投自己笔记里最怀疑的人，最后随机。
     suspect = _suspect_from_notes(voter, state, exclude=protect)
     if suspect is not None:
         return suspect
