@@ -1860,7 +1860,7 @@ async def hunter_shoot(bot, state: GameState, panel: Panel, channel, hunter, day
         await panel.show(title=title, desc=f"🏹 **{hunter.label}** 是猎人，正在决定开枪带走谁……",
                          color=C_WIN_WOLF, footer="猎人正在开枪…")
         await asyncio.sleep(_npc_night_delay())  # 假装真人在犹豫开枪
-        target_uid = await npc.hunter_shoot_target(hunter, state)
+        target_uid = await npc.hunter_shoot_target(hunter, state, day_log)
     else:
         result: dict = {"uid": None}
         done = asyncio.Event()
