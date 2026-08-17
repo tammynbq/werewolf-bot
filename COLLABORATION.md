@@ -66,7 +66,7 @@
   合进 main（185f40a）。新增 `Role.HUNTER/GUARD`、`docs/12人局方案.md`。
 - **2026-06-27 · session nkjwmt** ·
   ① 开局可自选 6/12 人（大厅「👥6/12人」按钮 → `GameState.table_size`）。
-  ② 新增角色 NPC「叶衔青」（治愈系软萌）。③ LLM 空内容/思考型模型加固（token 下限 6000）。
+  ② LLM 空内容/思考型模型加固（token 下限 6000）。
 - **2026-06-26 · session nkjwmt** ·
   ① 限流加固：`llm.py` 加全局限速闸 `_throttle` + 429 退避加长；新增 `config.LLM_MIN_INTERVAL_SECONDS`。
   ② 决策改轻量规则省 API：验/刀/救毒/投票回归规则（投票仍会「跟预言家报验」「与自己发言一致」）。
@@ -115,8 +115,7 @@
   3. 角色归属：**Theo / 闻人幸 / Cassian / Severin 是你的，简介都用你的版本**，我没动人设。
      唯一例外——用户要 **Theo 的「展示名」显示中文名「沈玘言」**（就是它 persona 里的中文名），
      所以 `name="沈玘言"`、intro/persona 全是你的原版，没改内容。如果你想改回 "Theo" 跟我说。
-  4. 用户侧新增角色（我加的）：叶衔青、柳玄、崽崽(真名白起藏 persona)、Augustine、紀從政、
-     裴屿之、Renard。现在共 11 个。
+  4. 用户侧新增角色（我加的）：Augustine、紀從政、裴屿之、Renard。
   另：现在「冷静控场型」偏多，回头想配平衡可加点外向/激进型。
 
 - **nkjwmt → 队友（2026-06-28，需求1-4 落地）**：刚连推 4 个需求到 main，关键改动同步：
